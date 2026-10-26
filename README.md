@@ -26,6 +26,32 @@ NetPulse SysGuard collects **real hardware and network telemetry** from the host
 
 > **The live demo needs no server.** On GitHub Pages the dashboard detects that no backend is reachable and switches to an **in-browser simulation engine**: a TypeScript port of the backend's cluster simulator, Z-Score detector and port-risk catalogue. Metrics stream every second, you can launch simulated port audits, inject incidents and watch alerts fire. Run the backend locally and the same UI switches to **real telemetry**.
 
+## Live demo vs. real telemetry
+
+| | GitHub Pages demo | Local install |
+|---|---|---|
+| **Data** | Simulated 8-server enterprise cluster, generated in your browser | Your own machine's real `psutil` telemetry plus the simulated cluster |
+| **Anomaly detection** | Same Z-Score / regression algorithm, ported to TypeScript | Python detector, alerts persisted in SQLite |
+| **Port audits** | Simulated scans with realistic, deterministic results | Real asynchronous TCP scans of your private network |
+| **Setup** | None, just open the link | `git clone` + `python run.py` + `npm run dev` ([Installation](#installation)) |
+
+**Why the online demo is always simulated:** GitHub Pages only serves static files, so there is no Python process to run `psutil`. Real telemetry would also always describe the machine running the backend, not the visitor's computer. Browsers block an `https` page from calling a plain-`http` backend, so on Pages the dashboard skips the attempt and starts the simulation within a few hundred milliseconds. Pressing **Live backend** there only explains this in the log console.
+
+To see **real data from your own computer**, follow [Installation](#installation) and open `http://localhost:5173`. The dashboard detects the local backend automatically and adds your machine as a ninth, non-simulated node.
+
+## Dashboard tour
+
+| Panel | What to look at |
+|---|---|
+| **Header** | Overall cluster status (NOMINAL / ATTENTION / DEGRADED), data source selector, **Export report** (JSON snapshot of the cluster and its anomalies) and four KPIs: average uptime, total bandwidth, healthy vs. critical nodes and open alerts. |
+| **Infrastructure nodes** | One card per server, with CPU, RAM, NVMe storage, temperature and latency bars coloured green / amber / red by threshold. Values move every second, as real load does. Click a card to focus the charts on that server. |
+| **Network traffic / CPU load** | Native SVG charts of the last 120 seconds, for the whole cluster or for the selected server. |
+| **Port audit console** | Choose a server or IP and launch a scan. You get its open ports, services, risk levels and the remediation advice for each finding. |
+| **Incidents** | Anomalies the detector found by itself, each with the observed value, threshold and baseline. Use **Inject incident** (e.g. *Service down* on `web-app-01`) to trigger a failure and watch the card, the alert and the log react. |
+| **Log console** | A `journalctl`-style live feed of alerts, status changes, scans and operator actions. |
+
+In day-to-day operation only the status pill and the incident panel need attention. The rest of the screen is there to investigate when something turns red.
+
 ## Features
 
 | Area | What it does |
