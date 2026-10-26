@@ -37,6 +37,8 @@ def make_sample(
     upload: float = 10_000.0,
     download: float = 10_000.0,
     link_mbps: float = 1000.0,
+    temperature: float | None = None,
+    status: NodeStatus = NodeStatus.ONLINE,
 ) -> NodeTelemetry:
     return NodeTelemetry(
         node_id=node_id,
@@ -45,7 +47,7 @@ def make_sample(
         role=NodeRole.DATABASE,
         ip_address="10.0.0.11",
         is_simulated=True,
-        status=NodeStatus.ONLINE,
+        status=status,
         timestamp=T0 + timedelta(seconds=second),
         memory_total_mb=65536.0,
         link_capacity_mbps=link_mbps,
@@ -57,7 +59,30 @@ def make_sample(
         latency_ms=latency,
         net_upload_kbps=upload,
         net_download_kbps=download,
+        temperature_c=temperature,
     )
+
+
+def offline_sample(second: int, *, node_id: int = NODE_ID, **overrides: float | None) -> NodeTelemetry:
+    """An unreachable node: zeroed placeholder metrics, no latency and no temperature."""
+    values: dict[str, float | None] = {
+        "cpu": 0.0,
+        "memory": 0.0,
+        "latency": None,
+        "upload": 0.0,
+        "download": 0.0,
+        "temperature": None,
+    }
+    values.update(overrides)
+    return make_sample(second, node_id=node_id, status=NodeStatus.OFFLINE, **values)  # type: ignore[arg-type]
+
+
+def warm_up_thermal(detector: AnomalyDetector, rng: random.Random, samples: int = 40) -> int:
+    """Feed healthy samples with a ~60 °C temperature; returns the next free second index."""
+    for second in range(samples):
+        sample = stable_sample(rng, second, temperature=rng.gauss(60.0, 1.0))
+        assert detector.analyze(sample) == []
+    return samples
 
 
 def stable_sample(rng: random.Random, second: int, **overrides: float | None) -> NodeTelemetry:
@@ -404,6 +429,209 @@ def test_disk_jump_warning_then_critical_escalation_within_cooldown() -> None:
     critical = detector.analyze(stable_sample(rng, 42, disk=93.0))
     assert types_of(critical) == [AnomalyType.DISK_PRESSURE]
     assert critical[0].severity is AlertSeverity.CRITICAL
+
+
+def test_thermal_warning_on_absolute_limit() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(22)
+    second = warm_up_thermal(detector, rng)
+    alerts = detector.analyze(stable_sample(rng, second, temperature=83.5))
+    assert types_of(alerts) == [AnomalyType.THERMAL_SPIKE]
+    alert = alerts[0]
+    assert alert.severity is AlertSeverity.WARNING
+    assert alert.metric_name == "temperature_c"
+    assert alert.observed_value == 83.5
+    assert alert.threshold == 80.0
+    assert alert.baseline_mean == pytest.approx(60.0, abs=1.0)
+    assert alert.z_score is not None and alert.z_score > 3.0
+    assert "db-primary-01" in alert.message
+    assert "83.5°C" in alert.message
+
+
+def test_thermal_critical_and_cooldown() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(23)
+    second = warm_up_thermal(detector, rng)
+    alerts = detector.analyze(stable_sample(rng, second, temperature=93.0))
+    assert types_of(alerts) == [AnomalyType.THERMAL_SPIKE]
+    assert alerts[0].severity is AlertSeverity.CRITICAL
+    assert alerts[0].threshold == 90.0
+    assert detector.analyze(stable_sample(rng, second + 1, temperature=94.0)) == []
+    # Baseline freezing: the overheating samples have not polluted the baseline.
+    assert detector.baseline_snapshot(NODE_ID)["temperature_c"]["mean"] == pytest.approx(60.0, abs=1.0)
+
+
+def test_thermal_warning_escalates_to_critical_within_cooldown() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(24)
+    second = warm_up_thermal(detector, rng)
+    warning = detector.analyze(stable_sample(rng, second, temperature=85.0))
+    assert [alert.severity for alert in warning] == [AlertSeverity.WARNING]
+    assert detector.analyze(stable_sample(rng, second + 1, temperature=86.0)) == []
+    critical = detector.analyze(stable_sample(rng, second + 2, temperature=91.0))
+    assert [alert.severity for alert in critical] == [AlertSeverity.CRITICAL]
+
+
+def test_thermal_zscore_jump_warns_below_absolute_limit() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(25)
+    second = warm_up_thermal(detector, rng)
+    alerts = detector.analyze(stable_sample(rng, second, temperature=75.0))
+    assert types_of(alerts) == [AnomalyType.THERMAL_SPIKE]
+    assert alerts[0].severity is AlertSeverity.WARNING
+    assert alerts[0].threshold == 3.0
+    assert alerts[0].z_score is not None and alerts[0].z_score > 3.0
+    assert "Sudden temperature rise" in alerts[0].message
+
+
+def test_thermal_deviation_below_jump_floor_is_ignored() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(26)
+    second = warm_up_thermal(detector, rng)
+    # Statistically significant (z >> 3) but still a comfortable operating temperature.
+    assert detector.analyze(stable_sample(rng, second, temperature=66.0)) == []
+
+
+def test_thermal_critical_without_baseline() -> None:
+    detector = AnomalyDetector(make_settings())
+    alerts = detector.analyze(make_sample(0, temperature=95.0))
+    assert types_of(alerts) == [AnomalyType.THERMAL_SPIKE]
+    assert alerts[0].severity is AlertSeverity.CRITICAL
+    assert alerts[0].z_score is None
+    assert alerts[0].baseline_mean is None
+
+
+def test_missing_temperature_is_skipped() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(27)
+    for second in range(60):
+        assert detector.analyze(stable_sample(rng, second, temperature=None)) == []
+    assert detector.baseline_snapshot(NODE_ID)["temperature_c"] == {"count": 0, "mean": None, "std": None}
+
+
+def test_temperature_is_part_of_baseline_snapshot() -> None:
+    detector = AnomalyDetector(make_settings())
+    assert detector.baseline_snapshot(NODE_ID)["temperature_c"] == {"count": 0, "mean": None, "std": None}
+    rng = random.Random(28)
+    warm_up_thermal(detector, rng, samples=30)
+    snapshot = detector.baseline_snapshot(NODE_ID)
+    assert set(snapshot) == {
+        "cpu_percent",
+        "memory_percent",
+        "disk_percent",
+        "latency_ms",
+        "net_total_kbps",
+        "temperature_c",
+    }
+    assert snapshot["temperature_c"]["count"] == 30
+    assert snapshot["temperature_c"]["mean"] == pytest.approx(60.0, abs=1.0)
+
+
+def test_service_down_below_threshold_is_silent() -> None:
+    detector = AnomalyDetector(make_settings())
+    assert detector.analyze(offline_sample(0)) == []
+    assert detector.analyze(offline_sample(1)) == []
+
+
+def test_service_down_alert_at_threshold_then_cooldown() -> None:
+    detector = AnomalyDetector(make_settings())
+    assert detector.analyze(offline_sample(0)) == []
+    assert detector.analyze(offline_sample(1)) == []
+    alerts = detector.analyze(offline_sample(2))
+    assert types_of(alerts) == [AnomalyType.SERVICE_DOWN]
+    alert = alerts[0]
+    assert alert.node_id == NODE_ID
+    assert alert.severity is AlertSeverity.CRITICAL
+    assert alert.metric_name == "offline_samples"
+    assert alert.observed_value == 3.0
+    assert alert.threshold == 3.0
+    assert alert.baseline_mean is None and alert.baseline_std is None and alert.z_score is None
+    assert alert.detected_at == T0 + timedelta(seconds=2)
+    assert "db-primary-01" in alert.message
+    assert "3 consecutive samples" in alert.message
+    assert "~3s" in alert.message
+
+    # Still down, same severity: suppressed by the cooldown.
+    assert detector.analyze(offline_sample(3)) == []
+    assert detector.analyze(offline_sample(4)) == []
+
+
+def test_service_down_repeats_after_cooldown() -> None:
+    detector = AnomalyDetector(make_settings(anomaly_cooldown_seconds=10))
+    assert types_of([a for second in range(3) for a in detector.analyze(offline_sample(second))]) == [
+        AnomalyType.SERVICE_DOWN
+    ]
+    assert detector.analyze(offline_sample(9)) == []
+    repeated = detector.analyze(offline_sample(12))
+    assert types_of(repeated) == [AnomalyType.SERVICE_DOWN]
+    assert repeated[0].observed_value == 5.0  # samples seen so far, not seconds elapsed
+    assert "~13s" in repeated[0].message
+
+
+def test_service_down_threshold_is_configurable() -> None:
+    detector = AnomalyDetector(make_settings(anomaly_service_down_samples=1))
+    alerts = detector.analyze(offline_sample(0))
+    assert types_of(alerts) == [AnomalyType.SERVICE_DOWN]
+    assert alerts[0].threshold == 1.0
+
+
+def test_service_down_counter_resets_on_recovery() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(29)
+    assert detector.analyze(offline_sample(0)) == []
+    assert detector.analyze(offline_sample(1)) == []
+    assert detector.analyze(stable_sample(rng, 2)) == []  # node is back
+    assert detector.analyze(offline_sample(3)) == []
+    assert detector.analyze(offline_sample(4)) == []  # only 2 consecutive since recovery
+    alerts = detector.analyze(offline_sample(5))
+    assert types_of(alerts) == [AnomalyType.SERVICE_DOWN]
+    assert alerts[0].observed_value == 3.0
+    # Downtime is measured from the first sample of the *current* outage.
+    assert "~3s" in alerts[0].message
+
+
+def test_offline_samples_do_not_alter_baselines() -> None:
+    detector = AnomalyDetector(make_settings())
+    rng = random.Random(30)
+    second = warm_up_thermal(detector, rng)
+    before = detector.baseline_snapshot(NODE_ID)
+    for offset in range(10):
+        detector.analyze(offline_sample(second + offset))
+    assert detector.baseline_snapshot(NODE_ID) == before
+
+    # The baseline is still intact after recovery: a real spike is detected against it.
+    alerts = detector.analyze(stable_sample(rng, second + 10, cpu=97.0, temperature=60.0))
+    assert types_of(alerts) == [AnomalyType.CPU_SPIKE]
+    assert alerts[0].baseline_mean == pytest.approx(30.0, abs=2.0)
+
+
+def test_offline_samples_never_run_other_evaluators() -> None:
+    detector = AnomalyDetector(make_settings())
+    # Values that would trip disk, CPU, latency, bandwidth and thermal rules if they were evaluated.
+    hot = {
+        "cpu": 99.0,
+        "disk": 97.0,
+        "latency": 400.0,
+        "upload": 600_000.0,
+        "download": 600_000.0,
+        "temperature": 99.0,
+    }
+    assert detector.analyze(offline_sample(0, **hot)) == []
+    assert detector.analyze(offline_sample(1, **hot)) == []
+    assert types_of(detector.analyze(offline_sample(2, **hot))) == [AnomalyType.SERVICE_DOWN]
+    for metric in detector.baseline_snapshot(NODE_ID).values():
+        assert metric == {"count": 0, "mean": None, "std": None}
+
+
+def test_service_down_is_tracked_per_node() -> None:
+    detector = AnomalyDetector(make_settings())
+    for second in range(2):
+        detector.analyze(offline_sample(second, node_id=1))
+        detector.analyze(offline_sample(second, node_id=2))
+    assert types_of(detector.analyze(offline_sample(2, node_id=1))) == [AnomalyType.SERVICE_DOWN]
+    # Node 2 recovers before reaching the threshold and never alerts.
+    assert detector.analyze(make_sample(2, node_id=2)) == []
+    assert detector.analyze(offline_sample(3, node_id=2)) == []
 
 
 def test_at_most_one_alert_per_type_per_sample() -> None:

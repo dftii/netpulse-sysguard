@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     anomaly_bandwidth_saturation_percent: float = Field(default=85.0, gt=0, le=100)
     anomaly_latency_critical_ms: float = Field(default=250.0, gt=0)
     anomaly_disk_critical_percent: float = Field(default=92.0, gt=0, le=100)
+    anomaly_temperature_warning_c: float = Field(default=80.0, gt=0, le=150)
+    anomaly_temperature_critical_c: float = Field(default=90.0, gt=0, le=150)
+    anomaly_service_down_samples: int = Field(default=3, ge=1, le=600)
     anomaly_cooldown_seconds: int = Field(default=60, ge=0)
 
     # Port scanner

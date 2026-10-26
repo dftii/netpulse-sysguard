@@ -1,0 +1,55 @@
+# NetPulse SysGuard backend stack.
+#
+#   docker compose up -d --build                 start the API on http://127.0.0.1:8000
+#   docker compose --profile seed run --rm seed  load demo data into the database
+#   docker compose logs -f backend               follow the API logs
+#   docker compose down                          stop the stack (the data volume is kept)
+#
+# Overrides: copy values into backend/.env (see backend/.env.example). The file is optional.
+
+x-backend-build: &backend-build
+  context: ./backend
+  dockerfile: Dockerfile
+
+x-backend-env-file: &backend-env-file
+  - path: ./backend/.env
+    required: false
+
+services:
+  backend:
+    build: *backend-build
+    image: netpulse-sysguard-backend
+    container_name: netpulse-backend
+    restart: unless-stopped
+    ports:
+      # Published on loopback only: the API has no authentication and can launch port
+      # scans. Use "8000:8000" to expose it on the LAN deliberately.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - netpulse-data:/app/data
+    env_file: *backend-env-file
+    environment:
+      # Identifies this deployment in the health endpoint. Overrides backend/.env.
+      NETPULSE_ENVIRONMENT: docker
+      # Python logging level: DEBUG, INFO, WARNING, ERROR.
+      # NETPULSE_LOG_LEVEL: INFO
+      # JSON list of browser origins allowed to call the API, for example the dashboard.
+      # NETPULSE_CORS_ORIGINS: '["http://localhost:5173", "http://localhost:3000"]'
+
+  # One-shot job that seeds the database. It is excluded from `docker compose up`
+  # and runs only when the "seed" profile is requested.
+  seed:
+    build: *backend-build
+    image: netpulse-sysguard-backend
+    profiles: ["seed"]
+    restart: "no"
+    command: ["python", "seed.py"]
+    volumes:
+      - netpulse-data:/app/data
+    env_file: *backend-env-file
+    environment:
+      NETPULSE_ENVIRONMENT: docker
+
+volumes:
+  netpulse-data:
+    name: netpulse-data

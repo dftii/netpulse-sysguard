@@ -6,7 +6,8 @@ snapshots. It composes two sources:
 * :class:`HostTelemetrySource` samples the machine the backend runs on using ``psutil``.
 * :class:`EnterpriseClusterSimulator` generates believable metrics for eight enterprise nodes,
   including an incident engine (CPU spikes, memory leaks, bandwidth saturation, latency
-  degradation and disk pressure) that the anomaly detector can be exercised against.
+  degradation, disk pressure, service outages and thermal spikes) that the anomaly detector
+  can be exercised against.
 """
 
 from __future__ import annotations
@@ -644,8 +645,19 @@ _NORMAL_MEMORY_CEILING = 88.0
 _NORMAL_DISK_CEILING = 90.0
 _NORMAL_NET_CEILING_FRACTION = 0.85
 _NORMAL_LATENCY_CEILING_MS = 15.0
+_NORMAL_TEMPERATURE_CEILING_C = 78.0  # stays below the 80 C anomaly warning threshold
 _DISK_CLEANUP_THRESHOLD = 84.0
 _DISK_CLEANUP_DROP = 6.0
+
+# Thermal spike (cooling failure) incident: temperature target range, hard clamp and ramp speed.
+_THERMAL_TARGET_RANGE_C = (91.0, 98.0)
+_THERMAL_TARGET_JITTER_C = 0.3
+_THERMAL_INCIDENT_MIN_C = 88.0
+_THERMAL_INCIDENT_MAX_C = 105.0
+_THERMAL_RISE_RATE = 0.6  # fraction of the gap to the target closed per tick
+_THERMAL_NOISE_SCALE = 0.5  # sensor noise is damped while the heat sink is saturated
+_TEMPERATURE_RELAX_RATE = 0.15  # fraction of the gap to the load-driven target closed per tick
+_COOLING_CPU_RESIDUAL = 0.5  # CPU residual (points) above which load may legitimately run hot
 
 # Per-tick decay of the post-incident residual for each metric (smooth recovery).
 _RESIDUAL_DECAY: dict[str, float] = {
@@ -671,16 +683,21 @@ class _Incident:
 
 @dataclass(frozen=True, slots=True)
 class _SimSample:
-    """Metrics generated for one simulated node on one tick."""
+    """Metrics generated for one simulated node on one tick.
+
+    While a SERVICE_DOWN incident is active the node is unreachable: ``latency_ms`` and
+    ``temperature_c`` are ``None`` and every load metric is zero (``disk_percent`` keeps the
+    last known level).
+    """
 
     cpu_percent: float
     memory_percent: float
     disk_percent: float
-    latency_ms: float
+    latency_ms: float | None
     net_upload_kbps: float
     net_download_kbps: float
     process_count: int
-    temperature_c: float
+    temperature_c: float | None
     uptime_seconds: float
     incident: AnomalyType | None
 
@@ -695,6 +712,7 @@ class _SimNode:
     incident_probability: float
     boot_offset_seconds: float
     disk_level: float = 0.0
+    last_disk_percent: float = 0.0
     temperature: float = 0.0
     cpu_noise: float = 0.0
     memory_noise: float = 0.0
@@ -712,6 +730,7 @@ class _SimNode:
 
     def __post_init__(self) -> None:
         self.disk_level = self.profile.base_disk
+        self.last_disk_percent = self.profile.base_disk
         self.temperature = self.profile.temp_idle_c + self.profile.temp_load_c * (
             self.profile.base_cpu / 100.0
         )
@@ -749,14 +768,26 @@ class _SimNode:
             incident.target = rng.uniform(0.88, 0.99)
         elif kind is AnomalyType.CRITICAL_LATENCY:
             incident.target = rng.uniform(280.0, 700.0)
-        else:  # AnomalyType.DISK_PRESSURE
+        elif kind is AnomalyType.DISK_PRESSURE:
             incident.target = rng.uniform(93.0, 98.0)
             incident.value = disk_now
             incident.rate = max(0.15, (incident.target - disk_now) / max(1.0, incident.remaining * 0.5))
+        elif kind is AnomalyType.THERMAL_SPIKE:
+            incident.target = rng.uniform(*_THERMAL_TARGET_RANGE_C)
+            incident.value = self.temperature
+        elif kind is AnomalyType.SERVICE_DOWN:
+            incident.target = 0.0  # the node is unreachable: there is no metric to drive
+        else:
+            raise ValueError(f"Unsupported simulated incident kind: {kind!r}")
         self.incident = incident
 
     def _apply_incident(self, incident: _Incident) -> dict[str, float]:
-        """Compute the forced metric values for this tick of an active incident."""
+        """Compute the forced metric values for this tick of an active incident.
+
+        SERVICE_DOWN and THERMAL_SPIKE force no residual-tracked metric: an outage replaces the
+        whole sample (see :meth:`_offline_sample`) and a thermal spike drives the temperature
+        model directly (``incident.value`` holds this tick's temperature target).
+        """
         rng = self.rng
         capacity_kbps = self.profile.link_capacity_kbps
         forced: dict[str, float] = {}
@@ -774,10 +805,68 @@ class _SimNode:
             forced["latency"] = _clamp(
                 incident.target + rng.gauss(0.0, incident.target * 0.08), 280.0, 900.0
             )
-        else:  # AnomalyType.DISK_PRESSURE
+        elif incident.kind is AnomalyType.DISK_PRESSURE:
             incident.value = min(incident.target, incident.value + incident.rate)
             forced["disk"] = incident.value
+        elif incident.kind is AnomalyType.THERMAL_SPIKE:
+            incident.value = _clamp(
+                incident.target + rng.uniform(-_THERMAL_TARGET_JITTER_C, _THERMAL_TARGET_JITTER_C),
+                _THERMAL_INCIDENT_MIN_C,
+                _THERMAL_INCIDENT_MAX_C,
+            )
+        elif incident.kind is not AnomalyType.SERVICE_DOWN:
+            raise ValueError(f"Unsupported simulated incident kind: {incident.kind!r}")
         return forced
+
+    def _offline_sample(self, uptime_elapsed: float) -> _SimSample:
+        """Sample of a node whose service is down (unreachable / crashed).
+
+        Internal dynamics keep evolving (noise processes and disk growth already advanced in
+        :meth:`step`, the chassis cools towards idle) but nothing is fed to the residual
+        mechanism, so the node resumes its normal baseline right after the outage. The boot
+        offset is re-anchored every offline tick, which makes uptime restart from zero.
+        """
+        for metric in self.residual:
+            self.residual[metric] = 0.0
+        self.temperature += _TEMPERATURE_RELAX_RATE * (self.profile.temp_idle_c - self.temperature)
+        self.boot_offset_seconds = -uptime_elapsed
+        return _SimSample(
+            cpu_percent=0.0,
+            memory_percent=0.0,
+            disk_percent=round(self.last_disk_percent, 3),
+            latency_ms=None,
+            net_upload_kbps=0.0,
+            net_download_kbps=0.0,
+            process_count=0,
+            temperature_c=None,
+            uptime_seconds=0.0,
+            incident=AnomalyType.SERVICE_DOWN,
+        )
+
+    def _next_temperature(self, cpu: float, thermal_target: float | None, cpu_forced: bool) -> float:
+        """Advance the chassis temperature model one tick and return the sensor reading.
+
+        A thermal spike pulls the temperature quickly towards its (cooling failure) target.
+        Otherwise the temperature relaxes exponentially towards a load-driven target. Without an
+        incident influencing the load, the target and the reading stay under
+        ``_NORMAL_TEMPERATURE_CEILING_C``; a node cooling down after a spike or running hot
+        because of a CPU incident is not clamped.
+        """
+        p = self.profile
+        if thermal_target is not None:
+            self.temperature += _THERMAL_RISE_RATE * (thermal_target - self.temperature)
+            reading = self.temperature + _THERMAL_NOISE_SCALE * self.temperature_noise
+            return min(reading, _THERMAL_INCIDENT_MAX_C)
+
+        target = p.temp_idle_c + p.temp_load_c * cpu / 100.0
+        load_is_normal = not cpu_forced and abs(self.residual["cpu"]) <= _COOLING_CPU_RESIDUAL
+        if load_is_normal:
+            target = min(target, _NORMAL_TEMPERATURE_CEILING_C)
+        self.temperature += _TEMPERATURE_RELAX_RATE * (target - self.temperature)
+        reading = self.temperature + self.temperature_noise
+        if load_is_normal and self.temperature <= _NORMAL_TEMPERATURE_CEILING_C:
+            reading = min(reading, _NORMAL_TEMPERATURE_CEILING_C)
+        return reading
 
     # -- main step -------------------------------------------------------
 
@@ -857,13 +946,19 @@ class _SimNode:
         active_kind: AnomalyType | None = None
         forced: dict[str, float] = {}
         restart_service = False
+        thermal_target: float | None = None
         if self.incident is not None:
             active_kind = self.incident.kind
             forced = self._apply_incident(self.incident)
+            if active_kind is AnomalyType.THERMAL_SPIKE:
+                thermal_target = self.incident.value
             self.incident.remaining -= 1
             if self.incident.remaining <= 0:
-                restart_service = self.incident.kind is AnomalyType.MEMORY_LEAK
+                restart_service = active_kind is AnomalyType.MEMORY_LEAK
                 self.incident = None
+
+        if active_kind is AnomalyType.SERVICE_DOWN:
+            return self._offline_sample(uptime_elapsed)
 
         # Compose final values: during an incident the forced value wins; afterwards the
         # residual (forced - normal at the last incident tick) decays towards baseline.
@@ -889,9 +984,8 @@ class _SimNode:
 
         processes = max(1, round(p.base_processes + p.process_cpu_factor * cpu + self.process_noise))
 
-        temperature_target = p.temp_idle_c + p.temp_load_c * cpu / 100.0
-        self.temperature += 0.15 * (temperature_target - self.temperature)
-        temperature = self.temperature + self.temperature_noise
+        temperature = self._next_temperature(cpu, thermal_target, "cpu" in forced)
+        self.last_disk_percent = disk
 
         return _SimSample(
             cpu_percent=round(cpu, 2),
@@ -902,7 +996,7 @@ class _SimNode:
             net_download_kbps=round(download, 1),
             process_count=processes,
             temperature_c=round(temperature, 1),
-            uptime_seconds=self.boot_offset_seconds + uptime_elapsed,
+            uptime_seconds=max(0.0, self.boot_offset_seconds + uptime_elapsed),
             incident=active_kind,
         )
 
@@ -1047,6 +1141,15 @@ class TelemetryCollector:
         if self._simulator is not None:
             for hostname, sim in self._simulator.tick().items():
                 spec = self._specs[hostname]
+                if sim.incident is AnomalyType.SERVICE_DOWN:
+                    status = NodeStatus.OFFLINE
+                else:
+                    status = classify_status(
+                        sim.cpu_percent,
+                        sim.memory_percent,
+                        sim.disk_percent,
+                        sim.latency_ms,
+                    )
                 snapshots.append(
                     NodeTelemetry(
                         node_id=self._node_ids[hostname],
@@ -1055,12 +1158,7 @@ class TelemetryCollector:
                         role=spec.role,
                         ip_address=spec.ip_address,
                         is_simulated=True,
-                        status=classify_status(
-                            sim.cpu_percent,
-                            sim.memory_percent,
-                            sim.disk_percent,
-                            sim.latency_ms,
-                        ),
+                        status=status,
                         timestamp=timestamp,
                         cpu_percent=sim.cpu_percent,
                         memory_percent=sim.memory_percent,

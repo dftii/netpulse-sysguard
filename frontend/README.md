@@ -1,7 +1,7 @@
-# NetPulse SysGuard - Frontend (Phase 2, planned)
+# NetPulse SysGuard - Frontend (Phase 3, planned)
 
-This directory is a placeholder for the phase-2 web dashboard. The backend (FastAPI) is
-complete in phase 1; the frontend has not been scaffolded yet, so there is no build,
+This directory is a placeholder for the phase-3 web dashboard. The backend (FastAPI) is
+complete in phases 1 and 2; the frontend has not been scaffolded yet, so there is no build,
 dependency manifest or runnable code here at the moment.
 
 ## Planned stack
@@ -30,7 +30,7 @@ frontend/
 │   ├── pages/         Route-level views: cluster overview, node detail, port audit, alerts
 │   ├── services/      HTTP and WebSocket clients for the backend API
 │   └── types/         TypeScript types mirroring backend schemas and enums
-└── (package.json, Vite and TypeScript configuration are added when phase 2 starts)
+└── (package.json, Vite and TypeScript configuration are added when phase 3 starts)
 ```
 
 Each folder currently contains only a `.gitkeep` file so that Git tracks the empty

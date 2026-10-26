@@ -4,7 +4,7 @@ IT infrastructure monitoring, local network auditing and real-time anomaly detec
 
 NetPulse SysGuard collects **real hardware and network telemetry** from the host machine with `psutil`, augments it with a **simulated 8-server enterprise cluster**, streams everything over **WebSockets** every second, detects anomalies with **rolling Z-Score statistics and linear regression**, audits exposed TCP ports with a **risk classification engine**, and keeps a full incident history in **SQLite** for JSON/CSV technical reports.
 
-> Phase 1 (this release): architecture + complete backend. Phase 2: React dashboard. Phase 3: deployment and hardening.
+> Phase 1: architecture + core backend. Phase 2 (this release): enterprise backend — service-down and thermal detection, a 24 h demo dataset seeder and Docker packaging. Phase 3: React dashboard.
 
 ## Architecture
 
@@ -45,11 +45,15 @@ netpulse-sysguard/
 │   ├── tests/                        # pytest suite (unit + end-to-end)
 │   ├── data/                         # SQLite database (git-ignored)
 │   ├── run.py                        # Server entry point
+│   ├── seed.py                       # Idempotent 24 h demo dataset seeder (--reset)
+│   ├── Dockerfile                    # python:3.12-slim, non-root, healthcheck
+│   ├── .dockerignore
 │   ├── requirements.txt
 │   ├── requirements-dev.txt
 │   ├── pytest.ini
 │   └── .env.example
-├── frontend/                         # Phase 2 (React + Vite + TypeScript)
+├── frontend/                         # Phase 3 (React + Vite + TypeScript)
+├── docker-compose.yml
 ├── LICENSE
 └── README.md
 ```
@@ -67,7 +71,7 @@ netpulse-sysguard/
 | `nas-storage-01` | Storage | TrueNAS, high disk usage |
 | `dc-ad-01` | Domain controller | Windows Server 2022 AD |
 
-Each node combines a role baseline, a diurnal (time-of-day) load curve and mean-reverting noise. Random incidents (CPU spike, memory leak, bandwidth saturation, critical latency, disk pressure) occur on their own, and you can inject them on demand through the API.
+Each node combines a role baseline, a diurnal (time-of-day) load curve and mean-reverting noise. Random incidents (CPU spike, memory leak, bandwidth saturation, critical latency, disk pressure, service down, thermal spike) occur on their own, and you can inject them on demand through the API.
 
 ## Anomaly detection
 
@@ -78,6 +82,8 @@ Each node combines a role baseline, a diurnal (time-of-day) load curve and mean-
 | Bandwidth saturation | Link utilisation % against NIC capacity, plus Z-Score bursts |
 | Critical latency | Absolute threshold plus Z-Score relative to the baseline |
 | Disk pressure | Absolute threshold plus Z-Score jumps |
+| Service down | Node reported OFFLINE for N consecutive samples (`NETPULSE_ANOMALY_SERVICE_DOWN_SAMPLES`); offline samples never touch the baselines |
+| Thermal spike | Warning / critical temperature limits plus Z-Score jumps above 70 °C |
 
 During a sustained incident the baseline is frozen, so the anomaly does not become the new normal. Cooldowns are applied per node and per anomaly type to prevent alert floods. A WARNING alert can still escalate to CRITICAL during the cooldown.
 
@@ -98,12 +104,31 @@ cp .env.example .env          # optional
 python run.py                 # http://127.0.0.1:8000/docs
 ```
 
+Load the demo dataset (8 servers, 200 metric samples per server over the last 24 h, historical incidents and port audits with critical findings). The seeder is idempotent; `--reset` wipes and regenerates the seeded servers' data without touching the real host:
+
+```bash
+cd backend
+python seed.py            # or: python seed.py --reset
+```
+
 Run the tests:
 
 ```bash
 cd backend
 pytest
 ```
+
+## Docker
+
+```bash
+docker compose up -d --build                      # API on http://127.0.0.1:8000 (loopback only)
+docker compose --profile seed run --rm seed       # optional: load the demo dataset
+docker compose ps                                 # STATUS shows (healthy) once /api/health answers
+```
+
+The image is based on `python:3.12-slim`, runs as a non-root user, stores SQLite in the `netpulse-data` volume (`/app/data`) and checks `/api/health` with a `HEALTHCHECK`. It always runs a single uvicorn worker, because the telemetry pipeline, detector baselines and WebSocket clients live in process memory.
+
+> **Telemetry inside a container.** `psutil` reads the kernel it runs on. Inside Docker the "host" node reports the container's view: its cgroup CPU/memory and, on Docker Desktop for Windows/macOS, the Linux VM, not your physical machine. Temperatures are usually unavailable. The simulated cluster, the detector, the scanner and the API behave the same. For real host telemetry, run natively with `python run.py`.
 
 ## API
 

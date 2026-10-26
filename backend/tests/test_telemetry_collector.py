@@ -355,6 +355,164 @@ async def test_injected_disk_pressure_climbs(constant_diurnal: None) -> None:
 
 
 @pytest.mark.asyncio
+async def test_injected_service_down_reports_offline_node(constant_diurnal: None) -> None:
+    collector = make_collector()
+    before = by_host(await collector.collect())["web-app-01"]
+    collector.inject_incident("web-app-01", AnomalyType.SERVICE_DOWN, 8)
+
+    for _ in range(8):
+        snapshots = await collector.collect()
+        node = by_host(snapshots)["web-app-01"]
+        assert node.simulated_incident is AnomalyType.SERVICE_DOWN
+        assert node.status is NodeStatus.OFFLINE
+        assert node.latency_ms is None
+        assert node.temperature_c is None
+        assert node.cpu_percent == 0.0
+        assert node.memory_percent == 0.0
+        assert node.memory_used_mb == 0.0
+        assert node.net_upload_kbps == 0.0
+        assert node.net_download_kbps == 0.0
+        assert node.process_count == 0
+        assert node.uptime_seconds == 0.0
+        assert node.disk_percent == pytest.approx(before.disk_percent, abs=0.5)
+        assert node.disk_percent > 0.0
+        # Other simulated nodes are unaffected by the outage.
+        others = [s for s in snapshots if s.is_simulated and s.hostname != "web-app-01"]
+        assert all(s.simulated_incident is None and s.status is not NodeStatus.OFFLINE for s in others)
+
+
+@pytest.mark.asyncio
+async def test_service_down_recovers_with_baseline_load_and_rebooted_uptime(
+    constant_diurnal: None,
+) -> None:
+    collector = make_collector()
+    before = by_host(await collector.collect())["web-app-01"]
+    assert before.uptime_seconds > 86400.0  # booted days ago
+    collector.inject_incident("web-app-01", AnomalyType.SERVICE_DOWN, 5)
+    for _ in range(5):
+        assert by_host(await collector.collect())["web-app-01"].status is NodeStatus.OFFLINE
+
+    recovery = [by_host(await collector.collect())["web-app-01"] for _ in range(5)]
+
+    for node in recovery:
+        assert node.simulated_incident is None
+        assert node.status in (NodeStatus.ONLINE, NodeStatus.WARNING)
+        assert node.cpu_percent > 5.0
+        assert node.memory_percent > 20.0
+        assert node.memory_used_mb > 0.0
+        assert node.process_count > 0
+        assert node.latency_ms is not None
+        assert node.temperature_c is not None
+        assert node.uptime_seconds < 60.0  # the node rebooted
+    # Straight back to baseline (web-app-01 idles around 33 % CPU), not a decay from zero.
+    assert 15.0 < recovery[0].cpu_percent < 55.0
+    assert recovery[0].memory_percent == pytest.approx(before.memory_percent, abs=5.0)
+    assert recovery[-1].uptime_seconds >= recovery[0].uptime_seconds
+
+
+@pytest.mark.asyncio
+async def test_service_down_ignores_residual_from_a_previous_incident(constant_diurnal: None) -> None:
+    collector = make_collector()
+    collector.inject_incident("db-primary-01", AnomalyType.CPU_SPIKE, 5)
+    for _ in range(5):
+        await collector.collect()
+    collector.inject_incident("db-primary-01", AnomalyType.SERVICE_DOWN, 3)
+    for _ in range(3):
+        assert by_host(await collector.collect())["db-primary-01"].status is NodeStatus.OFFLINE
+
+    node = by_host(await collector.collect())["db-primary-01"]
+
+    assert node.simulated_incident is None
+    assert node.cpu_percent < 70.0  # the stale CPU-spike residual was discarded
+
+
+@pytest.mark.asyncio
+async def test_injected_thermal_spike_exceeds_critical_temperature(constant_diurnal: None) -> None:
+    collector = make_collector()
+    before = by_host(await collector.collect())["ai-gpu-node-01"]
+    collector.inject_incident("ai-gpu-node-01", AnomalyType.THERMAL_SPIKE, 30)
+
+    series = [by_host(await collector.collect())["ai-gpu-node-01"] for _ in range(30)]
+
+    assert all(node.simulated_incident is AnomalyType.THERMAL_SPIKE for node in series)
+    assert all(node.temperature_c is not None for node in series)
+    temperatures = [node.temperature_c for node in series if node.temperature_c is not None]
+    assert temperatures[0] < temperatures[2] < temperatures[4]  # rising
+    assert all(value > 90.0 for value in temperatures[5:])
+    assert all(value <= 105.0 for value in temperatures)
+    assert max(temperatures) > before.temperature_c + 15.0  # type: ignore[operator]
+    # Cooling failure only: the CPU is unaffected and the node stays reachable.
+    assert all(node.cpu_percent < 85.0 for node in series)
+    assert all(node.status is not NodeStatus.OFFLINE for node in series)
+
+
+@pytest.mark.asyncio
+async def test_thermal_spike_relaxes_after_the_incident(constant_diurnal: None) -> None:
+    collector = make_collector()
+    baseline = by_host(await collector.collect())["db-primary-01"].temperature_c
+    assert baseline is not None
+    collector.inject_incident("db-primary-01", AnomalyType.THERMAL_SPIKE, 10)
+    incident = [by_host(await collector.collect())["db-primary-01"] for _ in range(10)]
+    peak = max(node.temperature_c for node in incident if node.temperature_c is not None)
+
+    recovery = [by_host(await collector.collect())["db-primary-01"] for _ in range(40)]
+
+    assert peak > 90.0
+    assert recovery[0].simulated_incident is None
+    assert recovery[0].temperature_c is not None
+    assert 80.0 < recovery[0].temperature_c < peak  # gradual relaxation, not an instant drop
+    assert recovery[-1].temperature_c is not None
+    assert recovery[-1].temperature_c < 80.0
+    assert recovery[-1].temperature_c == pytest.approx(baseline, abs=6.0)
+
+
+@pytest.mark.parametrize("diurnal_value", [-1.0, 0.0, 1.0])
+def test_normal_operation_never_reaches_the_temperature_warning(
+    monkeypatch: pytest.MonkeyPatch, diurnal_value: float
+) -> None:
+    monkeypatch.setattr(tc, "_diurnal_factor", lambda: diurnal_value)
+    settings = make_settings(simulator_incident_probability=0.0)
+    simulator = tc.EnterpriseClusterSimulator(settings)
+
+    hottest = 0.0
+    for _ in range(4000):
+        for hostname, sample in simulator.tick().items():
+            assert sample.incident is None, hostname
+            assert sample.temperature_c is not None
+            hottest = max(hottest, sample.temperature_c)
+
+    assert hottest < settings.anomaly_temperature_warning_c
+    assert hottest <= tc._NORMAL_TEMPERATURE_CEILING_C
+
+
+def test_every_profile_stays_under_the_ceiling_at_peak_load() -> None:
+    """Even at the normal CPU ceiling, the load-driven temperature target (plus margin) is clamped."""
+    for profile in tc._PROFILES:
+        target = profile.temp_idle_c + profile.temp_load_c * tc._NORMAL_CPU_CEILING / 100.0
+        assert min(target, tc._NORMAL_TEMPERATURE_CEILING_C) < Settings().anomaly_temperature_warning_c
+
+
+@pytest.mark.asyncio
+async def test_random_incidents_can_pick_service_down_and_thermal_spike() -> None:
+    seen: set[AnomalyType] = set()
+    for seed in range(4):
+        collector = make_collector(simulator_seed=seed, simulator_incident_probability=1.0)
+        for _ in range(130):
+            for node in await collector.collect():
+                if node.simulated_incident is AnomalyType.SERVICE_DOWN:
+                    assert node.status is NodeStatus.OFFLINE
+                    assert node.latency_ms is None
+                    assert node.temperature_c is None
+                elif node.simulated_incident is AnomalyType.THERMAL_SPIKE:
+                    assert node.temperature_c is not None
+                    assert node.status is not NodeStatus.OFFLINE
+                if node.is_simulated and node.simulated_incident is not None:
+                    seen.add(node.simulated_incident)
+
+    assert seen == set(AnomalyType)
+
+
+@pytest.mark.asyncio
 async def test_injection_duration_is_converted_to_ticks(constant_diurnal: None) -> None:
     collector = make_collector(telemetry_interval_seconds=2.0)
     collector.inject_incident("db-primary-01", AnomalyType.CPU_SPIKE, 10)  # 5 ticks at 2 s

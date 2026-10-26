@@ -44,6 +44,8 @@ class AnomalyType(StrEnum):
     BANDWIDTH_SATURATION = "bandwidth_saturation"
     CRITICAL_LATENCY = "critical_latency"
     DISK_PRESSURE = "disk_pressure"
+    SERVICE_DOWN = "service_down"
+    THERMAL_SPIKE = "thermal_spike"
 
 
 class AlertSeverity(StrEnum):

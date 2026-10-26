@@ -8,6 +8,11 @@ z-score analysis, absolute thresholds and a linear-regression trend test:
 * BANDWIDTH_SATURATION  - link utilisation above a limit, or a traffic burst on a busy link
 * CRITICAL_LATENCY      - absolute latency limit or a large relative jump
 * DISK_PRESSURE         - absolute fill level or a sudden jump on an already full disk
+* THERMAL_SPIKE         - absolute temperature limits or a sudden rise towards a hot operating point
+* SERVICE_DOWN          - node unreachable (OFFLINE) for several consecutive samples
+
+OFFLINE samples carry placeholder metrics, so they only feed the service-down counter: they
+never reach a baseline and no other evaluator runs for them.
 
 Z-scores are always computed against the baseline *before* the new sample is pushed into
 it, so an anomaly never inflates its own baseline.  While a metric stays anomalous its
@@ -29,7 +34,7 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.enums import AlertSeverity, AnomalyType
+from app.enums import AlertSeverity, AnomalyType, NodeStatus
 from app.models import AnomalyAlert
 from app.schemas import AnomalyAlertCreate, NodeTelemetry
 
@@ -43,8 +48,19 @@ METRIC_MEMORY = "memory_percent"
 METRIC_DISK = "disk_percent"
 METRIC_LATENCY = "latency_ms"
 METRIC_NET_TOTAL = "net_total_kbps"
-TRACKED_METRICS: tuple[str, ...] = (METRIC_CPU, METRIC_MEMORY, METRIC_DISK, METRIC_LATENCY, METRIC_NET_TOTAL)
-_FROZEN_METRICS: frozenset[str] = frozenset({METRIC_CPU, METRIC_DISK, METRIC_LATENCY, METRIC_NET_TOTAL})
+METRIC_TEMPERATURE = "temperature_c"
+METRIC_OFFLINE_SAMPLES = "offline_samples"
+TRACKED_METRICS: tuple[str, ...] = (
+    METRIC_CPU,
+    METRIC_MEMORY,
+    METRIC_DISK,
+    METRIC_LATENCY,
+    METRIC_NET_TOTAL,
+    METRIC_TEMPERATURE,
+)
+_FROZEN_METRICS: frozenset[str] = frozenset(
+    {METRIC_CPU, METRIC_DISK, METRIC_LATENCY, METRIC_NET_TOTAL, METRIC_TEMPERATURE}
+)
 
 _CPU_SUSTAINED_SAMPLES = 3
 _CPU_MIN_ABSOLUTE_PERCENT = 50.0
@@ -58,6 +74,7 @@ _BANDWIDTH_BURST_MIN_PERCENT = 50.0
 _LATENCY_MIN_ABSOLUTE_MS = 50.0
 _LATENCY_RELATIVE_FACTOR = 3.0
 _DISK_JUMP_MIN_PERCENT = 80.0
+_THERMAL_JUMP_MIN_C = 70.0
 
 _SEVERITY_RANK: dict[AlertSeverity, int] = {
     AlertSeverity.INFO: 0,
@@ -230,6 +247,8 @@ class _NodeState:
     anomalous_streak: dict[str, int] = field(default_factory=dict)
     cpu_critical_streak: int = 0
     last_alert: dict[AnomalyType, tuple[datetime, AlertSeverity]] = field(default_factory=dict)
+    offline_samples: int = 0
+    offline_since: datetime | None = None
 
 
 class AnomalyDetector:
@@ -245,6 +264,10 @@ class AnomalyDetector:
     def analyze(self, sample: NodeTelemetry) -> list[AnomalyAlertCreate]:
         """Update the node baseline with ``sample`` and return the alerts it triggers."""
         state = self._state_for(sample.node_id)
+        if sample.status is NodeStatus.OFFLINE:
+            return self._analyze_offline(sample, state)
+        state.offline_samples = 0
+        state.offline_since = None
         net_total = sample.net_upload_kbps + sample.net_download_kbps
 
         observations: dict[str, _Observation] = {
@@ -254,6 +277,8 @@ class AnomalyDetector:
         }
         if sample.latency_ms is not None:
             observations[METRIC_LATENCY] = self._observe(state, METRIC_LATENCY, sample.latency_ms)
+        if sample.temperature_c is not None:
+            observations[METRIC_TEMPERATURE] = self._observe(state, METRIC_TEMPERATURE, sample.temperature_c)
 
         state.memory_window.append(sample.memory_percent)
         state.stats[METRIC_MEMORY].push(sample.memory_percent)
@@ -264,11 +289,25 @@ class AnomalyDetector:
             self._evaluate_bandwidth(sample, observations[METRIC_NET_TOTAL]),
             self._evaluate_latency(sample, observations.get(METRIC_LATENCY)),
             self._evaluate_disk(sample, observations[METRIC_DISK]),
+            self._evaluate_temperature(sample, observations.get(METRIC_TEMPERATURE)),
         ]
 
         for metric, observation in observations.items():
             self._update_baseline(state, metric, observation)
 
+        return self._admit_all(state, candidates)
+
+    def _analyze_offline(self, sample: NodeTelemetry, state: _NodeState) -> list[AnomalyAlertCreate]:
+        """Count consecutive unreachable samples; the placeholder metrics are never analysed."""
+        state.offline_samples += 1
+        if state.offline_since is None:
+            state.offline_since = sample.timestamp
+        return self._admit_all(state, [self._evaluate_service_down(sample, state)])
+
+    def _admit_all(
+        self, state: _NodeState, candidates: Sequence[AnomalyAlertCreate | None]
+    ) -> list[AnomalyAlertCreate]:
+        """Apply the cooldown to every candidate and return (and log) the ones that pass."""
         alerts: list[AnomalyAlertCreate] = []
         for candidate in candidates:
             if candidate is not None and self._admit(state, candidate):
@@ -569,6 +608,74 @@ class AnomalyDetector:
                 AnomalyType.CRITICAL_LATENCY,
                 AlertSeverity.WARNING,
                 METRIC_LATENCY,
+                observation,
+                z_threshold,
+                message,
+            )
+        return None
+
+    def _evaluate_service_down(self, sample: NodeTelemetry, state: _NodeState) -> AnomalyAlertCreate | None:
+        threshold = self._settings.anomaly_service_down_samples
+        if state.offline_samples < threshold:
+            return None
+        since = state.offline_since if state.offline_since is not None else sample.timestamp
+        # The node was last seen alive one telemetry interval before its first offline sample.
+        downtime = (sample.timestamp - since).total_seconds() + self._settings.telemetry_interval_seconds
+        observation = _Observation(value=float(state.offline_samples), mean=None, std=None, z=None)
+        message = (
+            f"Service down on {sample.hostname}: node unreachable for "
+            f"{state.offline_samples} consecutive samples (~{_format_duration(downtime)})"
+        )
+        return self._build(
+            sample,
+            AnomalyType.SERVICE_DOWN,
+            AlertSeverity.CRITICAL,
+            METRIC_OFFLINE_SAMPLES,
+            observation,
+            float(threshold),
+            message,
+        )
+
+    def _evaluate_temperature(
+        self, sample: NodeTelemetry, observation: _Observation | None
+    ) -> AnomalyAlertCreate | None:
+        if observation is None:
+            return None
+        cfg = self._settings
+        value = observation.value
+        z_threshold = cfg.anomaly_zscore_threshold
+
+        if value >= cfg.anomaly_temperature_critical_c:
+            lead = [f"limit {cfg.anomaly_temperature_critical_c:.0f}°C"]
+            message = f"Critical temperature on {sample.hostname}: {value:.1f}°C{self._clause(observation, '°C', lead)}"
+            return self._build(
+                sample,
+                AnomalyType.THERMAL_SPIKE,
+                AlertSeverity.CRITICAL,
+                METRIC_TEMPERATURE,
+                observation,
+                cfg.anomaly_temperature_critical_c,
+                message,
+            )
+        if value >= cfg.anomaly_temperature_warning_c:
+            lead = [f"limit {cfg.anomaly_temperature_warning_c:.0f}°C"]
+            message = f"High temperature on {sample.hostname}: {value:.1f}°C{self._clause(observation, '°C', lead)}"
+            return self._build(
+                sample,
+                AnomalyType.THERMAL_SPIKE,
+                AlertSeverity.WARNING,
+                METRIC_TEMPERATURE,
+                observation,
+                cfg.anomaly_temperature_warning_c,
+                message,
+            )
+        if observation.z is not None and observation.z >= z_threshold and value >= _THERMAL_JUMP_MIN_C:
+            message = f"Sudden temperature rise on {sample.hostname}: {value:.1f}°C{self._clause(observation, '°C')}"
+            return self._build(
+                sample,
+                AnomalyType.THERMAL_SPIKE,
+                AlertSeverity.WARNING,
+                METRIC_TEMPERATURE,
                 observation,
                 z_threshold,
                 message,

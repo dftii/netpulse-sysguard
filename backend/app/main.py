@@ -108,6 +108,10 @@ async def run_tick(runtime: Runtime) -> TelemetryBroadcast:
         warning_nodes = {alert.node_id for alert in persisted_alerts if alert.severity == AlertSeverity.WARNING}
         escalated: list[NodeTelemetry] = []
         for sample in samples:
+            if sample.status == NodeStatus.OFFLINE:
+                # An unreachable node stays OFFLINE; its SERVICE_DOWN alert must not mask that state.
+                escalated.append(sample)
+                continue
             if sample.node_id in critical_nodes and sample.status != NodeStatus.CRITICAL:
                 sample = sample.model_copy(update={"status": NodeStatus.CRITICAL})
             elif sample.node_id in warning_nodes and sample.status == NodeStatus.ONLINE:

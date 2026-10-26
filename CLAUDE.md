@@ -13,8 +13,8 @@ Contexto para que Claude retome el proyecto en cualquier máquina.
 ## Fases
 
 1. **Fase 1 — Backend: COMPLETADA.** 158 tests en verde. Subida en el commit `ec9e029`.
-2. **Fase 2 — Frontend: PENDIENTE (siguiente paso).** Dashboard en React 18 + Vite + TypeScript + TailwindCSS + Recharts que consume `ws://localhost:8000/ws/telemetry` y la API REST. El plan de carpetas está en `frontend/README.md`, y `frontend/src/{components,hooks,pages,services,types}` solo contienen `.gitkeep`.
-3. **Fase 3 — Despliegue y hardening: PENDIENTE.** El usuario aún no la ha detallado. Lo previsible es Docker/compose, CI con GitHub Actions y pulido del README con capturas.
+2. **Fase 2 — Backend empresarial: COMPLETADA.** 217 tests en verde. Incluye las anomalías SERVICE_DOWN y THERMAL_SPIKE (en el detector y en el simulador), `seed.py` idempotente con `--reset`, Docker y compose, y `.dockerignore`.
+3. **Fase 3 — Frontend: PENDIENTE (siguiente paso).** Dashboard en React 18 + Vite + TypeScript + TailwindCSS + Recharts que consume `ws://localhost:8000/ws/telemetry` y la API REST. El plan de carpetas está en `frontend/README.md`, y `frontend/src/{components,hooks,pages,services,types}` solo contienen `.gitkeep`. Lo previsible después es CI con GitHub Actions y pulir el README con capturas.
 
 ## Stack del backend
 
@@ -40,7 +40,11 @@ backend/app/
     network_scanner.py      NetworkScanner async TCP connect, banners, latencia, COMMON_PORTS (44), ScanTargetError
     anomaly_detector.py     RollingStatistics, linear_regression, AnomalyDetector (Z-Score, leak por regresión, cooldown)
     report_exporter.py      exportación de alertas, métricas y auditorías a JSON/CSV + build_filename
-backend/tests/   conftest.py (BD temporal + variables de entorno) y una suite por módulo + test_api.py (E2E)
+backend/seed.py   seed idempotente: los 8 nodos del simulador (mismos hostnames), 200 métricas por nodo en 24 h,
+                  alertas de todos los AnomalyType y PortAudit con findings críticos (usa el catálogo del escáner)
+backend/Dockerfile  python:3.12-slim, usuario no-root (uid 10001), VOLUME /app/data, HEALTHCHECK /api/health, 1 worker
+docker-compose.yml  servicio backend (127.0.0.1:8000) + servicio `seed` bajo el profile "seed"
+backend/tests/   conftest.py (BD temporal + variables de entorno) y una suite por módulo + test_seed.py + test_api.py (E2E)
 ```
 
 Pipeline por tick: `collector.collect()` → `detector.analyze_and_persist()` → escalado de estado → `crud.record_tick()` (métricas cada `metrics_persist_every_n_ticks`) → `ws_manager.broadcast(TelemetryBroadcast)`.
@@ -50,7 +54,10 @@ Detalles a tener en cuenta:
 - SQLite pierde la zona horaria. Todo se guarda en UTC, y `UTCDateTime` en schemas vuelve a añadir UTC al leer.
 - `build_filename` solo acepta prefijos `[A-Za-z0-9_-]`. `main.attachment()` sanea el prefijo antes de llamarla.
 - Por defecto el escáner solo acepta IPs privadas, de loopback o link-local (`NETPULSE_SCAN_ALLOW_PUBLIC_TARGETS`). Un `429` indica que hay más de 2 escaneos simultáneos.
-- El simulador solo llega a valores críticos durante incidentes, sean aleatorios o inyectados con `POST /api/simulation/incidents`.
+- El simulador solo llega a valores críticos durante incidentes, sean aleatorios o inyectados con `POST /api/simulation/incidents`. En operación normal la temperatura no pasa de 78 °C, y el umbral de aviso está en 80 °C.
+- SERVICE_DOWN: el nodo se emite con `status=offline`, métricas a 0, y `latency_ms` y `temperature_c` a `None`. El detector cuenta las muestras OFFLINE consecutivas sin tocar los baselines y alerta al llegar a `NETPULSE_ANOMALY_SERVICE_DOWN_SAMPLES`. `run_tick` nunca escala un nodo OFFLINE a CRITICAL.
+- Seed: se salta una tabla de un nodo si ese nodo ya tiene filas con más de 1 h de antigüedad. `--reset` borra solo los datos de los 8 nodos sembrados y nunca toca el host real.
+- En Docker, psutil mide el contenedor o la VM, no el host. Para telemetría real hay que usar `python run.py` en nativo.
 
 ## API (resumen para el frontend)
 
@@ -72,8 +79,11 @@ cd backend
 python -m venv .venv            # Python 3.11+ (en el PC original: 3.14)
 .venv/Scripts/activate          # Linux/macOS: source .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                          # esperado: 158 passed
+pytest                          # esperado: 217 passed
+python seed.py                  # opcional: datos demo de 24 h (--reset para regenerarlos)
 python run.py                   # http://127.0.0.1:8000/docs
 ```
+
+Con Docker: `docker compose up -d --build` y, opcionalmente, `docker compose --profile seed run --rm seed`.
 
 Si `pip` falla compilando `pydantic-core`, la versión de Python no tiene wheels para los pins. Usa Python 3.12, 3.13 o 3.14.

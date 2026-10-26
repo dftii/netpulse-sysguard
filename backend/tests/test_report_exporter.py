@@ -296,6 +296,8 @@ def test_alerts_to_json_summary_counts() -> None:
         "bandwidth_saturation": 1,
         "critical_latency": 0,
         "disk_pressure": 0,
+        "service_down": 0,
+        "thermal_spike": 0,
     }
     assert summary["by_node"] == {"web-01": 2, "db-01": 1, "node_3": 1}
 

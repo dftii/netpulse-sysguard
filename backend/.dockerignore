@@ -1,0 +1,46 @@
+# Build context for backend/Dockerfile. Everything not listed here is sent to the daemon.
+
+# Python virtual environments and bytecode caches
+.venv/
+venv/
+**/__pycache__
+**/*.py[cod]
+**/*.pyo
+**/*.egg-info
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Tests and development-only files (the image holds only runtime code)
+tests/
+pytest.ini
+requirements-dev.txt
+
+# Local data, databases and secrets. The data directory is recreated in the image.
+data/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.env
+.env.*
+**/*.log
+
+# Version control, editors and OS files
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+**/*.swp
+**/*.swo
+**/*~
+.DS_Store
+Thumbs.db
+
+# Docker files are not needed inside the image
+Dockerfile
+.dockerignore

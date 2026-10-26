@@ -179,6 +179,37 @@ def test_incident_injection_detected_and_exported(client: TestClient) -> None:
     assert csv_report.headers["content-type"].startswith("text/csv")
 
 
+def test_service_down_keeps_node_offline(client: TestClient) -> None:
+    nodes = [node for node in client.get("/api/nodes").json() if node["is_simulated"]]
+    target = nodes[-1]
+
+    response = client.post(
+        "/api/simulation/incidents",
+        json={"hostname": target["hostname"], "anomaly_type": "service_down", "duration_seconds": 20},
+    )
+    assert response.status_code == 202
+
+    deadline = time.monotonic() + 12
+    alerts: list[dict] = []
+    while time.monotonic() < deadline:
+        page = client.get("/api/alerts", params={"node_id": target["id"], "anomaly_type": "service_down"}).json()
+        alerts = page["items"]
+        if alerts:
+            break
+        time.sleep(0.5)
+    assert alerts, "Injected service outage was not detected"
+    assert alerts[0]["severity"] == "critical"
+
+    # The critical SERVICE_DOWN alert must not escalate the unreachable node to CRITICAL.
+    latest = client.get("/api/telemetry/latest").json()
+    snapshot = next(node for node in latest["nodes"] if node["node_id"] == target["id"])
+    assert snapshot["status"] == "offline"
+    assert snapshot["latency_ms"] is None
+    assert snapshot["simulated_incident"] == "service_down"
+    assert latest["summary"]["offline"] >= 1
+    assert client.get(f"/api/nodes/{target['id']}").json()["status"] == "offline"
+
+
 def test_metrics_report(client: TestClient) -> None:
     node_id = client.get("/api/nodes").json()[0]["id"]
     json_report = client.get(f"/api/reports/metrics/{node_id}", params={"hours": 1})
