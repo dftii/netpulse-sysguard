@@ -18,7 +18,10 @@ What gets written
 * ``AnomalyAlert`` rows generated *from those incident windows*: every alert points at the
   sample that triggered it, its observed value is that sample's value, and its baseline comes
   from the node's quiet samples. All ``AnomalyType`` values are covered, with mixed severities
-  and a mix of acknowledged and open alerts.
+  and a mix of acknowledged and open alerts. Alert semantics follow the live detector: link
+  utilisation is the busiest direction over the capacity (full duplex), a CRITICAL CPU alert is
+  a sustained critical load (three samples at or above the limit), and a statistical CPU outlier
+  is a WARNING that persisted for ten consecutive samples.
 * One ``PortAudit`` + ``PortFinding`` set per node, built as ``PortScanOutcome`` objects with the
   network scanner's own catalogue, classification (banner escalation included) and risk score,
   and saved with ``crud.save_port_audit``.
@@ -74,7 +77,7 @@ from app.services.anomaly_detector import (
     METRIC_DISK,
     METRIC_LATENCY,
     METRIC_MEMORY,
-    METRIC_NET_TOTAL,
+    METRIC_NET_PEAK,
     METRIC_OFFLINE_SAMPLES,
     METRIC_TEMPERATURE,
     linear_regression,
@@ -120,11 +123,16 @@ _BURST_SAMPLE_RATE = 3.0  # one sample covers ~7 minutes, so bursts are likelier
 _NORMAL_CPU_CEILING = 88.5
 _NORMAL_MEMORY_CEILING = 88.0
 _NORMAL_DISK_CEILING = 90.0
-_NORMAL_NET_CEILING_FRACTION = 0.85
+_NORMAL_NET_CEILING_FRACTION = 0.80  # per direction: links are full duplex and 85 % is the saturation limit
 _NORMAL_LATENCY_CEILING_MS = 15.0
 
-# Detector rules that decide alert severity (kept in sync with app/services/anomaly_detector.py).
-_CPU_CRITICAL_Z_FACTOR = 1.5
+# Detector rules that decide alert shape and severity (kept in sync with app/services/anomaly_detector.py;
+# tests/test_seed.py asserts the values still match).
+_CPU_SUSTAINED_SAMPLES = 3  # consecutive samples at or above the critical CPU limit
+_CPU_OUTLIER_PERSISTENCE_SAMPLES = 10  # consecutive statistical outliers before a WARNING is raised
+_CPU_OUTLIER_MIN_PERCENT = 70.0
+_CPU_OUTLIER_MIN_RISE_POINTS = 20.0
+_CPU_WARNING_CEILING = 89.5  # a statistical outlier is only a WARNING, so it stays below the critical limit
 _MEMORY_CRITICAL_PERCENT = 90.0
 _BANDWIDTH_CRITICAL_PERCENT = 95.0
 _METRIC_NET_UTILISATION = "net_utilization_percent"
@@ -147,7 +155,11 @@ class IncidentPlan:
     """One historical incident: shapes the metrics of a node and produces the matching alert(s).
 
     ``severity`` is the worst severity the incident reaches. Memory leaks and critical thermal
-    events escalate and therefore produce a WARNING alert followed by a CRITICAL one.
+    events escalate and therefore produce a WARNING alert followed by a CRITICAL one. A CRITICAL
+    CPU incident is the detector's sustained-critical-load alert (three consecutive samples at or
+    above the critical limit); a WARNING one is a statistical outlier that persisted for ten
+    consecutive samples. Bandwidth incidents drive the busiest link direction (the link is full
+    duplex), not the sum of both.
     ``acknowledge_after_minutes`` is None for alerts that are still open.
     """
 
@@ -162,7 +174,7 @@ class IncidentPlan:
 INCIDENT_PLANS: tuple[IncidentPlan, ...] = (
     IncidentPlan("db-primary-01", AnomalyType.CPU_SPIKE, AlertSeverity.CRITICAL, 21.8, 3, 12),
     IncidentPlan("nas-storage-01", AnomalyType.DISK_PRESSURE, AlertSeverity.CRITICAL, 19.6, 4, 35),
-    IncidentPlan("web-app-01", AnomalyType.CPU_SPIKE, AlertSeverity.WARNING, 17.4, 2, 8),
+    IncidentPlan("web-app-01", AnomalyType.CPU_SPIKE, AlertSeverity.WARNING, 17.4, 12, 8),
     IncidentPlan("lb-edge-01", AnomalyType.BANDWIDTH_SATURATION, AlertSeverity.CRITICAL, 14.3, 3, 22),
     IncidentPlan("cache-redis-01", AnomalyType.MEMORY_LEAK, AlertSeverity.CRITICAL, 13.0, 16, None),
     IncidentPlan("fw-core-01", AnomalyType.BANDWIDTH_SATURATION, AlertSeverity.WARNING, 11.2, 2, None),
@@ -189,6 +201,8 @@ _ALLOWED_SEVERITIES: dict[AnomalyType, frozenset[AlertSeverity]] = {
 _MIN_INCIDENT_HOURS_AGO = 2.0
 _MAX_INCIDENT_HOURS_AGO = 23.0
 _MIN_LEAK_SAMPLES = 8
+_MIN_CRITICAL_CPU_SAMPLES = _CPU_SUSTAINED_SAMPLES
+_MIN_WARNING_CPU_SAMPLES = _CPU_OUTLIER_PERSISTENCE_SAMPLES
 _MIN_ESCALATING_THERMAL_SAMPLES = 2
 
 
@@ -523,7 +537,7 @@ class _HistoryBuilder:
             METRIC_MEMORY: _baseline(self._memory),
             METRIC_DISK: _baseline(self._disk),
             METRIC_LATENCY: _baseline([value for value in self._latency if value is not None]),
-            METRIC_NET_TOTAL: _baseline([up + down for up, down in zip(self._upload, self._download, strict=True)]),
+            METRIC_NET_PEAK: _baseline([max(up, down) for up, down in zip(self._upload, self._download, strict=True)]),
             METRIC_TEMPERATURE: _baseline(quiet_temperature),
         }
 
@@ -544,22 +558,35 @@ class _HistoryBuilder:
         critical = plan.severity is AlertSeverity.CRITICAL
         kind = plan.kind
         if kind is AnomalyType.CPU_SPIKE:
-            cpu = self._baselines[METRIC_CPU]
-            warning_peak = max(cpu.mean + 3.3 * cpu.std, cpu.mean + 10.5, 50.5)
+            floor = self._cpu_outlier_floor()
+            if not critical and floor + 0.5 > _CPU_WARNING_CEILING:
+                raise SeedError(
+                    f"{self._profile.hostname}: a statistical CPU outlier needs {floor:.1f}%, "
+                    f"which is not a WARNING (limit {self._settings.anomaly_cpu_critical_percent:.0f}%)"
+                )
             for i in indices:
-                value = rng.uniform(93.0, 99.0) if critical else min(_NORMAL_CPU_CEILING, warning_peak + rng.uniform(-1.0, 1.0))
-                self._cpu[i] = value
+                self._cpu[i] = (
+                    rng.uniform(93.0, 99.0)
+                    if critical
+                    else min(_CPU_WARNING_CEILING, rng.uniform(floor + 0.5, floor + 4.0))
+                )
         elif kind is AnomalyType.DISK_PRESSURE:
             for k, i in enumerate(indices):
                 self._disk[i] = min(98.5, rng.uniform(93.2, 94.6) + 0.8 * k)
         elif kind is AnomalyType.BANDWIDTH_SATURATION:
             p = self._profile
-            share = p.base_upload_fraction / (p.base_upload_fraction + p.base_download_fraction)
+            # Full duplex: the busiest direction (upload wins ties, like the detector) saturates the
+            # link on its own and the other one follows its usual proportion.
+            upload_is_busiest = p.base_upload_fraction >= p.base_download_fraction
+            proportion = min(p.base_upload_fraction, p.base_download_fraction) / max(
+                p.base_upload_fraction, p.base_download_fraction
+            )
             for i in indices:
                 utilisation = rng.uniform(0.955, 0.99) if critical else rng.uniform(0.87, 0.92)
-                total = self._capacity_kbps * utilisation
-                self._upload[i] = total * share
-                self._download[i] = total - total * share
+                busiest = self._capacity_kbps * utilisation
+                other = busiest * proportion * rng.uniform(0.85, 1.0)
+                self._upload[i] = busiest if upload_is_busiest else other
+                self._download[i] = other if upload_is_busiest else busiest
         elif kind is AnomalyType.CRITICAL_LATENCY:
             for i in indices:
                 self._latency[i] = rng.uniform(280.0, 450.0) if critical else rng.uniform(62.0, 95.0)
@@ -575,6 +602,21 @@ class _HistoryBuilder:
                 self._temperature_override[i] = rng.uniform(91.0, 96.0) if hot else rng.uniform(81.0, 85.0)
         elif kind is AnomalyType.SERVICE_DOWN:
             self._offline.update(indices)
+
+    def _cpu_outlier_floor(self) -> float:
+        """Lowest CPU value that is a z-score outlier and also clears the detector's absolute and rise floors."""
+        cpu = self._baselines[METRIC_CPU]
+        z_floor = cpu.mean + (self._settings.anomaly_zscore_threshold + 0.3) * cpu.std
+        return max(z_floor, cpu.mean + _CPU_OUTLIER_MIN_RISE_POINTS, _CPU_OUTLIER_MIN_PERCENT)
+
+    def _is_cpu_outlier(self, value: float) -> bool:
+        base = self._baselines[METRIC_CPU]
+        z = base.z(value)
+        return (
+            z is not None
+            and z >= self._settings.anomaly_zscore_threshold
+            and value >= max(base.mean + _CPU_OUTLIER_MIN_RISE_POINTS, _CPU_OUTLIER_MIN_PERCENT)
+        )
 
     def _pre_window_memory(self, start: int) -> float:
         before = self._memory[max(0, start - 3) : start]
@@ -678,15 +720,7 @@ class _HistoryBuilder:
         kind = plan.kind
 
         if kind is AnomalyType.CPU_SPIKE:
-            base = self._baselines[METRIC_CPU]
-            value = self._cpu[first]
-            z = base.z(value)
-            is_critical = value >= cfg.anomaly_cpu_critical_percent or (
-                z is not None and z >= cfg.anomaly_zscore_threshold * _CPU_CRITICAL_Z_FACTOR
-            )
-            severity = AlertSeverity.CRITICAL if is_critical else AlertSeverity.WARNING
-            message = f"CPU spike on {host}: {value:.1f}%{_clause(base, z, '%')}"
-            return [self._alert(plan, first, severity, METRIC_CPU, value, base, z, cfg.anomaly_zscore_threshold, message)]
+            return self._cpu_alerts(plan, indices)
 
         if kind is AnomalyType.DISK_PRESSURE:
             base = self._baselines[METRIC_DISK]
@@ -696,14 +730,16 @@ class _HistoryBuilder:
             return [self._alert(plan, first, AlertSeverity.CRITICAL, METRIC_DISK, value, base, base.z(value), limit, message)]
 
         if kind is AnomalyType.BANDWIDTH_SATURATION:
-            total = self._upload[first] + self._download[first]
+            upload, download = self._upload[first], self._download[first]
+            peak = max(upload, download)
+            direction = "upload" if upload >= download else "download"
             to_percent = 100.0 / self._capacity_kbps
-            raw_base = self._baselines[METRIC_NET_TOTAL]
+            raw_base = self._baselines[METRIC_NET_PEAK]
             base = raw_base.scaled(to_percent)
-            utilisation = total * to_percent
-            z = raw_base.z(total)
+            utilisation = peak * to_percent
+            z = raw_base.z(peak)
             severity = AlertSeverity.CRITICAL if utilisation >= _BANDWIDTH_CRITICAL_PERCENT else AlertSeverity.WARNING
-            throughput = f"{total / 1000.0:.1f} Mbps of {self._profile.link_capacity_mbps:g} Mbps"
+            throughput = f"{peak / 1000.0:.1f} Mbps {direction} of {self._profile.link_capacity_mbps:g} Mbps"
             message = f"Bandwidth saturation on {host}: link at {utilisation:.1f}% ({throughput}){_clause(base, z, '%')}"
             return [
                 self._alert(
@@ -741,6 +777,38 @@ class _HistoryBuilder:
         return [
             self._alert(plan, index, AlertSeverity.CRITICAL, METRIC_OFFLINE_SAMPLES, float(required), None, None, float(required), message)
         ]
+
+    def _cpu_alerts(self, plan: IncidentPlan, indices: list[int]) -> list[AnomalyAlert]:
+        """CRITICAL: sustained critical load; WARNING: a statistical outlier that persisted long enough."""
+        cfg = self._settings
+        host = self._profile.hostname
+        base = self._baselines[METRIC_CPU]
+        critical_limit = cfg.anomaly_cpu_critical_percent
+
+        if plan.severity is AlertSeverity.CRITICAL:
+            required = _CPU_SUSTAINED_SAMPLES
+            window = indices[:required]
+            if len(window) < required or any(self._cpu[i] < critical_limit for i in window):
+                raise SeedError(f"{host}: critical CPU load is not sustained for {required} samples")
+            index = window[-1]
+            value = self._cpu[index]
+            z = base.z(value)
+            lead = [f"{required} consecutive samples", f"limit {critical_limit:.0f}%"]
+            message = f"Sustained critical CPU load on {host}: {value:.1f}%{_clause(base, z, '%', lead)}"
+            return [self._alert(plan, index, AlertSeverity.CRITICAL, METRIC_CPU, value, base, z, critical_limit, message)]
+
+        required = _CPU_OUTLIER_PERSISTENCE_SAMPLES
+        window = indices[:required]
+        if len(window) < required or not all(self._is_cpu_outlier(self._cpu[i]) for i in window):
+            raise SeedError(f"{host}: CPU outlier is not sustained for {required} samples")
+        index = window[-1]
+        value = self._cpu[index]
+        if value >= critical_limit:
+            raise SeedError(f"{host}: a statistical CPU outlier must stay below the {critical_limit:.0f}% critical limit")
+        z = base.z(value)
+        lead = [f"{required} consecutive samples above baseline"]
+        message = f"CPU spike on {host}: {value:.1f}%{_clause(base, z, '%', lead)}"
+        return [self._alert(plan, index, AlertSeverity.WARNING, METRIC_CPU, value, base, z, cfg.anomaly_zscore_threshold, message)]
 
     def _memory_leak_alerts(self, plan: IncidentPlan, indices: list[int]) -> list[AnomalyAlert]:
         cfg = self._settings
@@ -784,7 +852,7 @@ class _HistoryBuilder:
         if plan.severity is AlertSeverity.CRITICAL:
             critical_index = next((i for i in indices if self._require(METRIC_TEMPERATURE, self._temperature, i) >= critical_limit), None)
             if critical_index is None:
-                raise SeedError(f"Thermal incident on {host} never reaches {critical_limit:.0f} °C")
+                raise SeedError(f"Thermal incident on {host} never reaches {critical_limit:.0f}°C")
             chosen.append(critical_index)
 
         alerts: list[AnomalyAlert] = []
@@ -794,7 +862,8 @@ class _HistoryBuilder:
             limit = critical_limit if is_critical else warning_limit
             severity = AlertSeverity.CRITICAL if is_critical else AlertSeverity.WARNING
             z = base.z(value)
-            message = f"Thermal spike on {host}: {value:.1f} °C{_clause(base, z, ' °C', [f'limit {limit:.0f} °C'])}"
+            title = "Critical temperature" if is_critical else "High temperature"
+            message = f"{title} on {host}: {value:.1f}°C{_clause(base, z, '°C', [f'limit {limit:.0f}°C'])}"
             alerts.append(self._alert(plan, index, severity, METRIC_TEMPERATURE, value, base, z, limit, message))
         return alerts
 
@@ -886,6 +955,9 @@ def _validate_plans(profiles: dict[str, _NodeProfile], settings: Settings) -> No
                 f"{_MAX_INCIDENT_HOURS_AGO:g} hours ago"
             )
         minimum = {
+            AnomalyType.CPU_SPIKE: _MIN_CRITICAL_CPU_SAMPLES
+            if incident.severity is AlertSeverity.CRITICAL
+            else _MIN_WARNING_CPU_SAMPLES,
             AnomalyType.SERVICE_DOWN: settings.anomaly_service_down_samples,
             AnomalyType.MEMORY_LEAK: _MIN_LEAK_SAMPLES,
             AnomalyType.THERMAL_SPIKE: _MIN_ESCALATING_THERMAL_SAMPLES

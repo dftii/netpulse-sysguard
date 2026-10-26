@@ -4,13 +4,20 @@
  * The detector keeps a bounded rolling baseline per node and per metric and combines z-score
  * analysis, absolute thresholds and a linear-regression trend test:
  *
- *  - cpu_spike             z-score outlier (with an absolute floor) or sustained critical load
+ *  - cpu_spike             z-score outlier on an already busy CPU, or sustained critical load
  *  - memory_leak           steady, strongly linear growth of memory utilisation
- *  - bandwidth_saturation  link utilisation above a limit, or a traffic burst on a busy link
+ *  - bandwidth_saturation  busiest-direction link utilisation above a limit, or a burst on a busy link
  *  - critical_latency      absolute latency limit or a large relative jump
  *  - disk_pressure         absolute fill level or a sudden jump on an already full disk
- *  - thermal_spike         absolute temperature limits or a sudden rise towards a hot operating point
+ *  - thermal_spike         absolute temperature limits or a sudden, large rise into the hot range
  *  - service_down          node unreachable (offline) for several consecutive samples
+ *
+ * Z-scores answer "is this unusual for this node?", not "is this dangerous?": live 1 Hz telemetry is
+ * noisy and bursty, so a statistical outlier only raises an alert when the value is also high in
+ * absolute terms and well above the baseline, and on its own it is never more than a warning.
+ * Critical is reserved for absolute limits (critical CPU, saturated link, critical latency...).
+ *
+ * Links are full duplex, so bandwidth utilisation is the busiest direction over the link capacity.
  *
  * Offline samples carry placeholder metrics, so they only feed the service-down counter: they never
  * reach a baseline and no other evaluator runs for them. Z-scores are computed against the baseline
@@ -65,7 +72,7 @@ const METRIC_CPU = "cpu_percent";
 const METRIC_MEMORY = "memory_percent";
 const METRIC_DISK = "disk_percent";
 const METRIC_LATENCY = "latency_ms";
-const METRIC_NET_TOTAL = "net_total_kbps";
+const METRIC_NET_PEAK = "net_peak_kbps";
 const METRIC_TEMPERATURE = "temperature_c";
 const METRIC_OFFLINE_SAMPLES = "offline_samples";
 const METRIC_NET_UTILISATION = "net_utilization_percent";
@@ -75,7 +82,7 @@ type TrackedMetric =
   | typeof METRIC_MEMORY
   | typeof METRIC_DISK
   | typeof METRIC_LATENCY
-  | typeof METRIC_NET_TOTAL
+  | typeof METRIC_NET_PEAK
   | typeof METRIC_TEMPERATURE;
 
 export const TRACKED_METRICS: readonly TrackedMetric[] = [
@@ -83,7 +90,7 @@ export const TRACKED_METRICS: readonly TrackedMetric[] = [
   METRIC_MEMORY,
   METRIC_DISK,
   METRIC_LATENCY,
-  METRIC_NET_TOTAL,
+  METRIC_NET_PEAK,
   METRIC_TEMPERATURE,
 ];
 
@@ -92,23 +99,26 @@ const FROZEN_METRICS: ReadonlySet<TrackedMetric> = new Set<TrackedMetric>([
   METRIC_CPU,
   METRIC_DISK,
   METRIC_LATENCY,
-  METRIC_NET_TOTAL,
+  METRIC_NET_PEAK,
   METRIC_TEMPERATURE,
 ]);
 
 const CPU_SUSTAINED_SAMPLES = 3;
-const CPU_MIN_ABSOLUTE_PERCENT = 50;
-const CPU_MIN_RISE_POINTS = 10;
-const CPU_CRITICAL_Z_FACTOR = 1.5;
+/** A CPU outlier must persist this many samples (seconds at 1 Hz) to alert: short bursts are normal. */
+const CPU_OUTLIER_PERSISTENCE_SAMPLES = 10;
+const CPU_MIN_ABSOLUTE_PERCENT = 70;
+const CPU_MIN_RISE_POINTS = 20;
 const MEMORY_LEAK_MIN_POINTS = 30;
 const MEMORY_LEAK_MIN_RISE_POINTS = 5;
 const MEMORY_CRITICAL_PERCENT = 90;
 const BANDWIDTH_CRITICAL_PERCENT = 95;
-const BANDWIDTH_BURST_MIN_PERCENT = 50;
+const BANDWIDTH_BURST_MIN_PERCENT = 60;
+const BANDWIDTH_BURST_MIN_RISE_POINTS = 15;
 const LATENCY_MIN_ABSOLUTE_MS = 50;
 const LATENCY_RELATIVE_FACTOR = 3;
 const DISK_JUMP_MIN_PERCENT = 80;
-const THERMAL_JUMP_MIN_C = 70;
+const THERMAL_JUMP_MIN_C = 75;
+const THERMAL_JUMP_MIN_RISE_C = 8;
 
 const SEVERITY_RANK: Readonly<Record<AlertSeverity, number>> = { info: 0, warning: 1, critical: 2 };
 
@@ -371,6 +381,7 @@ interface NodeState {
   memoryWindow: SlidingWindow;
   anomalousStreak: Partial<Record<TrackedMetric, number>>;
   cpuCriticalStreak: number;
+  cpuOutlierStreak: number;
   lastAlert: Partial<Record<AnomalyType, { at: number; severity: AlertSeverity }>>;
   offlineSamples: number;
   offlineSinceMs: number | null;
@@ -422,11 +433,12 @@ export class AnomalyDetector {
     }
     state.offlineSamples = 0;
     state.offlineSinceMs = null;
-    const netTotal = sample.net_upload_kbps + sample.net_download_kbps;
+    // Full-duplex link: each direction has the whole capacity, so the busiest one is what saturates.
+    const netPeak = Math.max(sample.net_upload_kbps, sample.net_download_kbps);
 
     const cpu = this.observe(state, METRIC_CPU, sample.cpu_percent);
     const disk = this.observe(state, METRIC_DISK, sample.disk_percent);
-    const net = this.observe(state, METRIC_NET_TOTAL, netTotal);
+    const net = this.observe(state, METRIC_NET_PEAK, netPeak);
     const latency =
       sample.latency_ms !== null ? this.observe(state, METRIC_LATENCY, sample.latency_ms) : null;
     const temperature =
@@ -446,7 +458,7 @@ export class AnomalyDetector {
 
     this.updateBaseline(state, METRIC_CPU, cpu);
     this.updateBaseline(state, METRIC_DISK, disk);
-    this.updateBaseline(state, METRIC_NET_TOTAL, net);
+    this.updateBaseline(state, METRIC_NET_PEAK, net);
     if (latency !== null) {
       this.updateBaseline(state, METRIC_LATENCY, latency);
     }
@@ -493,12 +505,13 @@ export class AnomalyDetector {
           [METRIC_MEMORY]: new RollingStatistics(window),
           [METRIC_DISK]: new RollingStatistics(window),
           [METRIC_LATENCY]: new RollingStatistics(window),
-          [METRIC_NET_TOTAL]: new RollingStatistics(window),
+          [METRIC_NET_PEAK]: new RollingStatistics(window),
           [METRIC_TEMPERATURE]: new RollingStatistics(window),
         },
         memoryWindow: new SlidingWindow(this.settings.memoryLeakWindow),
         anomalousStreak: {},
         cpuCriticalStreak: 0,
+        cpuOutlierStreak: 0,
         lastAlert: {},
         offlineSamples: 0,
         offlineSinceMs: null,
@@ -618,22 +631,24 @@ export class AnomalyDetector {
 
     state.cpuCriticalStreak = value >= critical ? state.cpuCriticalStreak + 1 : 0;
     const sustained = state.cpuCriticalStreak >= CPU_SUSTAINED_SAMPLES;
-    const statistical =
+    const outlier =
       observation.z !== null &&
       observation.mean !== null &&
       observation.z >= zThreshold &&
       value >= Math.max(observation.mean + CPU_MIN_RISE_POINTS, CPU_MIN_ABSOLUTE_PERCENT);
+    state.cpuOutlierStreak = outlier ? state.cpuOutlierStreak + 1 : 0;
+    const statistical = state.cpuOutlierStreak >= CPU_OUTLIER_PERSISTENCE_SAMPLES;
     if (!statistical && !sustained) {
       return null;
     }
 
-    const isCritical =
-      value >= critical || (observation.z !== null && observation.z >= zThreshold * CPU_CRITICAL_Z_FACTOR);
-    const severity: AlertSeverity = isCritical ? "critical" : "warning";
+    // A statistical outlier alone is a warning; only the absolute limit makes it critical.
+    const severity: AlertSeverity = value >= critical ? "critical" : "warning";
     let message: string;
     let threshold: number;
     if (statistical) {
-      message = `CPU spike on ${sample.hostname}: ${value.toFixed(1)}%${AnomalyDetector.clause(observation, "%")}`;
+      const lead = [`${state.cpuOutlierStreak} consecutive samples above baseline`];
+      message = `CPU spike on ${sample.hostname}: ${value.toFixed(1)}%${AnomalyDetector.clause(observation, "%", lead)}`;
       threshold = zThreshold;
     } else {
       const lead = [`${state.cpuCriticalStreak} consecutive samples`, `limit ${critical.toFixed(0)}%`];
@@ -682,13 +697,14 @@ export class AnomalyDetector {
     };
   }
 
-  private evaluateBandwidth(sample: NodeTelemetry, totalObservation: Observation): AlertDraft | null {
+  private evaluateBandwidth(sample: NodeTelemetry, peakObservation: Observation): AlertDraft | null {
     const cfg = this.settings;
     const capacityKbps = sample.link_capacity_mbps * 1000;
-    const observation = scaled(totalObservation, 100 / capacityKbps);
+    const observation = scaled(peakObservation, 100 / capacityKbps);
     const utilisation = observation.value;
     const zThreshold = cfg.zscoreThreshold;
-    const throughput = `${(totalObservation.value / 1000).toFixed(1)} Mbps of ${sample.link_capacity_mbps} Mbps`;
+    const direction = sample.net_upload_kbps >= sample.net_download_kbps ? "upload" : "download";
+    const throughput = `${(peakObservation.value / 1000).toFixed(1)} Mbps ${direction} of ${sample.link_capacity_mbps} Mbps`;
 
     if (utilisation >= cfg.bandwidthSaturationPercent) {
       const severity: AlertSeverity = utilisation >= BANDWIDTH_CRITICAL_PERCENT ? "critical" : "warning";
@@ -702,7 +718,12 @@ export class AnomalyDetector {
         message,
       };
     }
-    if (observation.z !== null && observation.z >= zThreshold && utilisation >= BANDWIDTH_BURST_MIN_PERCENT) {
+    if (
+      observation.z !== null &&
+      observation.mean !== null &&
+      observation.z >= zThreshold &&
+      utilisation >= Math.max(observation.mean + BANDWIDTH_BURST_MIN_RISE_POINTS, BANDWIDTH_BURST_MIN_PERCENT)
+    ) {
       const message = `Network traffic burst on ${sample.hostname}: link at ${utilisation.toFixed(1)}% (${throughput})${AnomalyDetector.clause(observation, "%")}`;
       return {
         anomalyType: "bandwidth_saturation",
@@ -807,7 +828,12 @@ export class AnomalyDetector {
         message,
       };
     }
-    if (observation.z !== null && observation.z >= cfg.zscoreThreshold && value >= THERMAL_JUMP_MIN_C) {
+    if (
+      observation.z !== null &&
+      observation.mean !== null &&
+      observation.z >= cfg.zscoreThreshold &&
+      value >= Math.max(observation.mean + THERMAL_JUMP_MIN_RISE_C, THERMAL_JUMP_MIN_C)
+    ) {
       const message = `Sudden temperature rise on ${sample.hostname}: ${value.toFixed(1)}°C${AnomalyDetector.clause(observation, "°C")}`;
       return {
         anomalyType: "thermal_spike",

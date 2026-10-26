@@ -20,6 +20,7 @@ from app.database import SessionLocal, dispose_db
 from app.enums import AlertSeverity, AnomalyType, NodeRole, PortState, RiskLevel
 from app.models import AnomalyAlert, MetricSample, Node, PortAudit, PortFinding
 from app.schemas import AnomalyAlertCreate, MetricValues
+from app.services import anomaly_detector, telemetry_collector
 from app.services.network_scanner import COMMON_PORTS, calculate_risk_score
 from app.services.telemetry_collector import EnterpriseClusterSimulator
 
@@ -155,7 +156,9 @@ async def test_metric_values_respect_schema_bounds_and_profile_capacity(session_
         )
         assert sample.memory_used_mb <= node.memory_total_mb
         capacity_kbps = node.link_capacity_mbps * 1000.0
-        assert sample.net_upload_kbps + sample.net_download_kbps <= capacity_kbps * 1.0001
+        # Full duplex: every direction has the whole capacity on its own.
+        assert sample.net_upload_kbps <= capacity_kbps * 1.0001
+        assert sample.net_download_kbps <= capacity_kbps * 1.0001
 
 
 async def test_quiet_samples_stay_near_the_profile_baselines(session_factory: SessionFactory) -> None:
@@ -256,6 +259,7 @@ async def test_alerts_round_trip_through_the_api_schemas(session_factory: Sessio
 async def test_each_alert_points_at_the_sample_that_triggered_it(session_factory: SessionFactory) -> None:
     await seed.seed_database(session_factory, now=NOW)
     ids = await _node_ids(session_factory)
+    nodes: dict[int, Node] = {node.id: node for node in await _scalars(session_factory, select(Node))}
     samples_by_node: dict[int, dict[datetime, MetricSample]] = {}
     for node_id in ids.values():
         samples: list[MetricSample] = await _scalars(
@@ -278,8 +282,10 @@ async def test_each_alert_points_at_the_sample_that_triggered_it(session_factory
             assert alert.observed_value == pytest.approx(sample.temperature_c, abs=0.01)
         elif kind is AnomalyType.SERVICE_DOWN:
             assert sample.latency_ms is None
-        else:
-            assert alert.observed_value > 85.0  # BANDWIDTH_SATURATION: link utilisation percent
+        else:  # BANDWIDTH_SATURATION: busiest-direction link utilisation percent
+            capacity_kbps = nodes[alert.node_id].link_capacity_mbps * 1000.0
+            expected = 100.0 * max(sample.net_upload_kbps, sample.net_download_kbps) / capacity_kbps
+            assert alert.observed_value == pytest.approx(expected, abs=0.01)
 
 
 async def test_alert_severity_follows_the_detector_thresholds(session_factory: SessionFactory) -> None:
@@ -301,6 +307,141 @@ async def test_alert_severity_follows_the_detector_thresholds(session_factory: S
             assert alert.observed_value >= settings.anomaly_disk_critical_percent
         if alert.anomaly_type is AnomalyType.SERVICE_DOWN:
             assert alert.observed_value == settings.anomaly_service_down_samples
+
+
+def test_seed_detector_constants_match_the_live_detector_and_simulator() -> None:
+    assert seed._CPU_SUSTAINED_SAMPLES == anomaly_detector._CPU_SUSTAINED_SAMPLES
+    assert seed._CPU_OUTLIER_PERSISTENCE_SAMPLES == anomaly_detector._CPU_OUTLIER_PERSISTENCE_SAMPLES
+    assert seed._CPU_OUTLIER_MIN_PERCENT == anomaly_detector._CPU_MIN_ABSOLUTE_PERCENT
+    assert seed._CPU_OUTLIER_MIN_RISE_POINTS == anomaly_detector._CPU_MIN_RISE_POINTS
+    assert seed._MEMORY_CRITICAL_PERCENT == anomaly_detector._MEMORY_CRITICAL_PERCENT
+    assert seed._BANDWIDTH_CRITICAL_PERCENT == anomaly_detector._BANDWIDTH_CRITICAL_PERCENT
+    assert seed._NORMAL_NET_CEILING_FRACTION == telemetry_collector._NORMAL_NET_CEILING_FRACTION == 0.80
+    assert seed._NORMAL_CPU_CEILING == telemetry_collector._NORMAL_CPU_CEILING
+    assert seed.METRIC_NET_PEAK == anomaly_detector.METRIC_NET_PEAK == "net_peak_kbps"
+
+
+def _incident_window(samples: list[MetricSample], plan: seed.IncidentPlan) -> list[MetricSample]:
+    """The samples an incident plan reshaped: ``length`` samples from the first one at or after its onset."""
+    onset = NOW - timedelta(hours=plan.hours_ago)
+    ordered = sorted(samples, key=lambda sample: _utc(sample.timestamp))
+    start = next(i for i, sample in enumerate(ordered) if _utc(sample.timestamp) >= onset)
+    return ordered[start : start + plan.length]
+
+
+async def test_bandwidth_alerts_use_the_busiest_direction_and_normal_traffic_stays_below_80_percent(
+    session_factory: SessionFactory,
+) -> None:
+    await seed.seed_database(session_factory, now=NOW)
+    settings = get_settings()
+    nodes: dict[int, Node] = {node.id: node for node in await _scalars(session_factory, select(Node))}
+    alerts: list[AnomalyAlert] = await _scalars(
+        session_factory, select(AnomalyAlert).where(AnomalyAlert.anomaly_type == AnomalyType.BANDWIDTH_SATURATION)
+    )
+    plans = [plan for plan in seed.INCIDENT_PLANS if plan.kind is AnomalyType.BANDWIDTH_SATURATION]
+    assert len(alerts) == len(plans) > 0
+    assert {plan.severity for plan in plans} == {AlertSeverity.WARNING, AlertSeverity.CRITICAL}
+
+    for alert in alerts:
+        node = nodes[alert.node_id]
+        capacity_kbps = node.link_capacity_mbps * 1000.0
+        trigger: MetricSample = (
+            await _scalars(
+                session_factory,
+                select(MetricSample).where(
+                    MetricSample.node_id == alert.node_id, MetricSample.timestamp == alert.detected_at
+                ),
+            )
+        )[0]
+        busiest = max(trigger.net_upload_kbps, trigger.net_download_kbps)
+        direction = "upload" if trigger.net_upload_kbps >= trigger.net_download_kbps else "download"
+
+        assert alert.observed_value == pytest.approx(100.0 * busiest / capacity_kbps, abs=0.01)
+        assert 85.0 <= alert.observed_value <= 99.0
+        assert alert.metric_name == "net_utilization_percent"
+        assert alert.threshold == settings.anomaly_bandwidth_saturation_percent
+        expected_severity = AlertSeverity.CRITICAL if alert.observed_value >= 95.0 else AlertSeverity.WARNING
+        assert alert.severity is expected_severity
+        assert f"link at {alert.observed_value:.1f}%" in alert.message
+        assert f"{busiest / 1000.0:.1f} Mbps {direction} of {node.link_capacity_mbps:g} Mbps" in alert.message
+        assert alert.baseline_mean is not None and alert.baseline_mean <= 80.0
+
+    for hostname, node_id in (await _node_ids(session_factory)).items():
+        capacity_kbps = nodes[node_id].link_capacity_mbps * 1000.0
+        samples: list[MetricSample] = await _scalars(
+            session_factory, select(MetricSample).where(MetricSample.node_id == node_id)
+        )
+        incident_stamps = {
+            sample.timestamp
+            for plan in plans
+            if plan.hostname == hostname
+            for sample in _incident_window(samples, plan)
+        }
+        assert len(incident_stamps) == sum(plan.length for plan in plans if plan.hostname == hostname)
+        for sample in samples:
+            busiest = max(sample.net_upload_kbps, sample.net_download_kbps)
+            if sample.timestamp in incident_stamps:
+                assert busiest >= 0.85 * capacity_kbps, hostname
+            else:
+                assert busiest <= 0.80 * capacity_kbps * 1.0001, hostname
+
+
+async def test_cpu_alerts_follow_the_sustained_and_persistent_outlier_rules(session_factory: SessionFactory) -> None:
+    await seed.seed_database(session_factory, now=NOW)
+    settings = get_settings()
+    hostnames = {node_id: hostname for hostname, node_id in (await _node_ids(session_factory)).items()}
+    alerts: list[AnomalyAlert] = await _scalars(
+        session_factory, select(AnomalyAlert).where(AnomalyAlert.anomaly_type == AnomalyType.CPU_SPIKE)
+    )
+    plans = [plan for plan in seed.INCIDENT_PLANS if plan.kind is AnomalyType.CPU_SPIKE]
+    assert len(alerts) == len(plans)
+    assert {alert.severity for alert in alerts} == {AlertSeverity.WARNING, AlertSeverity.CRITICAL}
+
+    for alert in alerts:
+        host = hostnames[alert.node_id]
+        plan = next(p for p in plans if p.hostname == host and p.severity is alert.severity)
+        samples: list[MetricSample] = await _scalars(
+            session_factory, select(MetricSample).where(MetricSample.node_id == alert.node_id)
+        )
+        window = _incident_window(samples, plan)
+        if alert.severity is AlertSeverity.CRITICAL:
+            trigger = window[2]
+            assert alert.observed_value >= settings.anomaly_cpu_critical_percent >= 90.0
+            assert all(sample.cpu_percent >= settings.anomaly_cpu_critical_percent for sample in window[:3])
+            assert alert.threshold == settings.anomaly_cpu_critical_percent
+            assert alert.message.startswith(f"Sustained critical CPU load on {host}: ")
+            assert "(3 consecutive samples, limit 90%, baseline " in alert.message
+        else:
+            trigger = window[9]
+            assert alert.observed_value < settings.anomaly_cpu_critical_percent
+            assert alert.baseline_mean is not None and alert.z_score is not None
+            assert alert.z_score >= settings.anomaly_zscore_threshold
+            assert alert.threshold == settings.anomaly_zscore_threshold
+            assert alert.message.startswith(f"CPU spike on {host}: ")
+            assert "(10 consecutive samples above baseline, baseline " in alert.message
+            floor = max(alert.baseline_mean + 20.0, 70.0)
+            for sample in window[:10]:
+                assert floor <= sample.cpu_percent < settings.anomaly_cpu_critical_percent
+        assert _utc(alert.detected_at) == _utc(trigger.timestamp)
+        assert alert.observed_value == pytest.approx(trigger.cpu_percent, abs=0.01)
+
+
+async def test_thermal_alerts_use_the_detector_wording_and_limits(session_factory: SessionFactory) -> None:
+    await seed.seed_database(session_factory, now=NOW)
+    settings = get_settings()
+
+    alerts: list[AnomalyAlert] = await _scalars(
+        session_factory, select(AnomalyAlert).where(AnomalyAlert.anomaly_type == AnomalyType.THERMAL_SPIKE)
+    )
+    assert {alert.severity for alert in alerts} == {AlertSeverity.WARNING, AlertSeverity.CRITICAL}
+    for alert in alerts:
+        critical = alert.severity is AlertSeverity.CRITICAL
+        limit = settings.anomaly_temperature_critical_c if critical else settings.anomaly_temperature_warning_c
+        title = "Critical temperature" if critical else "High temperature"
+        assert alert.message.startswith(f"{title} on ")
+        assert f"{alert.observed_value:.1f}°C (limit {limit:.0f}°C, baseline " in alert.message
+        assert alert.observed_value >= max(limit, 75.0)
+        assert alert.baseline_mean is not None and alert.observed_value >= alert.baseline_mean + 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +794,14 @@ async def test_unknown_node_in_the_plan_is_rejected(
         (
             seed.IncidentPlan("web-app-01", AnomalyType.SERVICE_DOWN, AlertSeverity.CRITICAL, 5.0, 1, None),
             "at least",
+        ),
+        (
+            seed.IncidentPlan("web-app-01", AnomalyType.CPU_SPIKE, AlertSeverity.WARNING, 5.0, 9, None),
+            "at least 10 samples",
+        ),
+        (
+            seed.IncidentPlan("web-app-01", AnomalyType.CPU_SPIKE, AlertSeverity.CRITICAL, 5.0, 2, None),
+            "at least 3 samples",
         ),
     ],
 )

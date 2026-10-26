@@ -54,22 +54,10 @@ export interface SimulationSourceOptions {
 
 const DEFAULT_INTERVAL_MS = 1000;
 const DEFAULT_INCIDENT_PROBABILITY = 0.002;
-/**
- * Burst amplitude relative to the backend profiles (1 = identical). Bursts are legitimate z-score
- * outliers, so at full scale they trigger statistical alerts even with a relaxed z-score limit; 0.35
- * keeps the charts lively while leaving incidents as the only alert source.
- */
-export const DEFAULT_BURST_SCALE = 0.35;
-/**
- * Detector thresholds of the simulation: the backend defaults except for the z-score limit. The
- * baseline window of an autocorrelated (Ornstein-Uhlenbeck) signal understates its real spread, so
- * the backend limit of 3.0 flags ordinary fluctuation about every 15 s across the cluster. With 6.0
- * quiet operation raises no alerts while every injected incident type is still detected.
- */
-export const SIMULATION_DETECTOR_SETTINGS: Readonly<DetectorSettings> = {
-  ...DEFAULT_DETECTOR_SETTINGS,
-  zscoreThreshold: 6,
-};
+/** Burst amplitude relative to the backend profiles (1 = identical). */
+export const DEFAULT_BURST_SCALE = 1;
+/** Detector thresholds of the simulation: identical to the backend defaults (backend/app/config.py). */
+export const SIMULATION_DETECTOR_SETTINGS: Readonly<DetectorSettings> = DEFAULT_DETECTOR_SETTINGS;
 const PREWARM_TICKS = 90;
 const DEMO_INCIDENT_MIN_TICKS = 15;
 const DEMO_INCIDENT_MAX_TICKS = 25;

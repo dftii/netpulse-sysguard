@@ -80,7 +80,7 @@ function diurnalFactor(at: Date): number {
 const NORMAL_CPU_CEILING = 88.5;
 const NORMAL_MEMORY_CEILING = 88;
 const NORMAL_DISK_CEILING = 90;
-const NORMAL_NET_CEILING_FRACTION = 0.85;
+const NORMAL_NET_CEILING_FRACTION = 0.8; // per direction, below the 85 % saturation limit
 const NORMAL_LATENCY_CEILING_MS = 15;
 const NORMAL_TEMPERATURE_CEILING_C = 78; // stays below the 80 C anomaly warning threshold
 const DISK_CLEANUP_THRESHOLD = 84;
@@ -477,9 +477,8 @@ export interface ClusterEngineOptions {
   /** Probability per node per tick of a random incident starting. */
   incidentProbability: number;
   /**
-   * Multiplier of the amplitude of the short load bursts (default 1, as in the backend). Bursts
-   * are legitimate statistical outliers, so at full scale the detector raises occasional warnings
-   * for them; lower values keep the charts lively while leaving incidents as the only alert source.
+   * Multiplier of the amplitude of the short load bursts (default 1, identical to the backend
+   * profiles). Lower values flatten the charts; the detector ignores short bursts at full scale.
    */
   burstScale?: number;
 }

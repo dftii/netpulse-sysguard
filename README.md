@@ -118,17 +118,17 @@ Each new value `x` is scored **before** it joins the baseline, so an anomaly nev
 
 $$z = \frac{x - \mu_{W}}{\sigma_{W}}$$
 
-A reading is anomalous when `z ≥ 3` (configurable) once at least 20 samples exist, combined with absolute floors so that tiny fluctuations on an idle server never alert. While a metric stays anomalous its samples are **withheld from the baseline** (baseline freezing); if the condition outlasts the window, it is accepted as the new normal.
+A reading is a statistical outlier when `z ≥ 3` (configurable) once at least 20 samples exist. A z-score says *unusual for this node*, not *dangerous*, so an outlier only alerts when the value is also high in absolute terms and well above the baseline, and on its own it is never more than a WARNING. CRITICAL is reserved for absolute limits. Live 1 Hz telemetry is bursty, so CPU outliers must also **persist for 10 consecutive samples**: a 5-second workload burst is normal, a runaway process is not. Against the simulated cluster with incidents disabled, these rules bring false alarms down from one every 28 s to zero in 8 simulated cluster-hours, while every injected incident type is still detected. While a metric stays anomalous its samples are **withheld from the baseline** (baseline freezing); if the condition outlasts the window, it is accepted as the new normal.
 
 | Detector | Method |
 |---|---|
-| CPU spike | Z-Score with an absolute floor, plus sustained load above 90 % for 3 samples |
+| CPU spike | Z-Score outlier ≥ 70 % and 20 points above baseline, held 10 samples (WARNING), or sustained load ≥ 90 % for 3 samples (CRITICAL) |
 | Memory leak | Least-squares slope and R² over a sliding window (slope ≥ 0.08 %/s, R² ≥ 0.85), with projected time to exhaustion |
-| Bandwidth saturation | Link utilisation against NIC capacity, plus Z-Score bursts on busy links |
+| Bandwidth saturation | Full-duplex utilisation (busiest direction / NIC capacity) ≥ 85 %, plus Z-Score bursts ≥ 60 % and 15 points above baseline |
 | Critical latency | Absolute limit (250 ms) plus a large jump relative to the baseline |
 | Disk pressure | Absolute fill level (92 %) plus sudden jumps on an already full disk |
 | Service down | Node OFFLINE for N consecutive samples; offline samples never touch the baselines |
-| Thermal spike | Warning / critical limits (80 / 90 °C) plus Z-Score jumps above 70 °C |
+| Thermal spike | Warning / critical limits (80 / 90 °C) plus Z-Score jumps ≥ 75 °C and 8 °C above baseline |
 
 Cooldowns are applied per node and per anomaly type to prevent alert floods, but a WARNING can still escalate to CRITICAL during the cooldown. An alert stores the observed value, threshold, baseline mean/std and z-score, so every incident is explainable.
 

@@ -80,10 +80,10 @@ function buildBody(profile: NodeProfile, type: AnomalyType, rng: Random, cfg: De
       const mean = profile.baseCpu + rng.uniform(-2, 2);
       const std = profile.cpuSigma * rng.uniform(1.2, 1.8);
       const z = zScore(value, mean, std);
-      const severity: AlertSeverity =
-        value >= cfg.cpuCriticalPercent || z >= cfg.zscoreThreshold * 1.5 ? "critical" : "warning";
-      const message = `CPU spike on ${host}: ${value.toFixed(1)}%${formatClause({ mean, std, z }, "%")}`;
-      return body(severity, "cpu_percent", value, mean, std, z, cfg.zscoreThreshold, message);
+      const samples = rng.int(10, 14);
+      const lead = [`${samples} consecutive samples above baseline`];
+      const message = `CPU spike on ${host}: ${value.toFixed(1)}%${formatClause({ mean, std, z }, "%", lead)}`;
+      return body("critical", "cpu_percent", value, mean, std, z, cfg.zscoreThreshold, message);
     }
     case "memory_leak": {
       const current = rng.uniform(91, 96.5);
@@ -102,11 +102,14 @@ function buildBody(profile: NodeProfile, type: AnomalyType, rng: Random, cfg: De
     }
     case "bandwidth_saturation": {
       const utilisation = rng.uniform(88, 97);
-      const baseline = (profile.baseUploadFraction + profile.baseDownloadFraction) * 100;
+      // Full duplex: the busiest direction is judged against the link capacity.
+      const busiest = Math.max(profile.baseUploadFraction, profile.baseDownloadFraction);
+      const direction = profile.baseUploadFraction >= profile.baseDownloadFraction ? "upload" : "download";
+      const baseline = busiest * 100;
       const std = baseline * 0.15;
       const z = zScore(utilisation, baseline, std);
       const severity: AlertSeverity = utilisation >= 95 ? "critical" : "warning";
-      const throughput = `${((utilisation / 100) * profile.linkCapacityMbps).toFixed(1)} Mbps of ${profile.linkCapacityMbps} Mbps`;
+      const throughput = `${((utilisation / 100) * profile.linkCapacityMbps).toFixed(1)} Mbps ${direction} of ${profile.linkCapacityMbps} Mbps`;
       const message = `Bandwidth saturation on ${host}: link at ${utilisation.toFixed(1)}% (${throughput})${formatClause({ mean: baseline, std, z }, "%")}`;
       return body(severity, "net_utilization_percent", utilisation, baseline, std, z, cfg.bandwidthSaturationPercent, message);
     }

@@ -29,8 +29,8 @@ src/components/{header,servers,charts,ui,scanner,incidents,console}/   App.tsx s
 ```
 
 - Detección de modo: primero manda `VITE_DEFAULT_MODE`; después, un host `*.github.io` va a simulación; después, una elección "simulation" guardada en localStorage (`netpulse.mode`); por último, un probe a `/api/health` con timeout de 1,5 s. El build de Pages usa `VITE_DEFAULT_MODE=simulation`. `vite.config.ts` lleva `base: "./"`.
-- En la simulación, `zscoreThreshold` es 6 y la amplitud de los bursts está al 35 %. Con los valores del backend (z=3) salían falsas alarmas en reposo, aproximadamente una cada 23 s.
-- Pendientes conocidos, en el backend: con z=3 también genera alertas en reposo. Además, el uso de ancho de banda divide subida+bajada entre la capacidad de un solo sentido, y por eso salen valores de hasta ~180 %.
+- Falsas alarmas corregidas en el detector y en su port TS. El z-score solo alerta con carga alta en absoluto (CPU ≥ 70 % y +20 puntos, ráfaga de red ≥ 60 % y +15 puntos, térmica ≥ 75 °C y +8 °C). Un outlier de CPU tiene que durar 10 muestras, y el z-score por sí solo da WARNING; CRITICAL solo sale por los umbrales absolutos. En reposo hay 0 alertas en 8 h de clúster simulado (antes, 1 cada 28 s), y el test `test_quiet_simulated_cluster_stays_quiet` lo exige. Para medirlo hay que ejecutar el simulador con `incident_probability=0` sobre `AnomalyDetector`.
+- Ancho de banda full-duplex: la utilización es `max(subida, bajada) / capacidad` y la métrica del baseline se llama `net_peak_kbps`. El techo normal del simulador es el 80 % por sentido.
 - Dev: `npm --prefix frontend run dev` (5173). Las versiones npm están fijadas (todas tienen más de 2 semanas de antigüedad). `.claude/launch.json` define las previsualizaciones de frontend y backend.
 
 ## Stack del backend

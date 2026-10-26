@@ -117,11 +117,13 @@ export function TrafficCharts({ clusterHistory, nodeHistory, nodes, selectedNode
   if (selectedNode) {
     trafficTotal = trafficLatest[0] ?? null;
     const capacity = selectedNode.link_capacity_mbps;
-    const utilisation = trafficTotal !== null && capacity > 0 ? (trafficTotal / capacity) * 100 : null;
+    // Links are full duplex: utilisation is the busiest direction over the capacity, not the sum.
+    const busiestMbps = Math.max(selectedNode.net_upload_kbps, selectedNode.net_download_kbps) / 1000;
+    const utilisation = capacity > 0 ? (busiestMbps / capacity) * 100 : null;
     trafficCaption =
       utilisation === null
         ? "Upload + download"
-        : `${formatPercent(utilisation)} of ${capacity.toLocaleString("en-US")} Mbps link`;
+        : `${formatPercent(utilisation)} of ${capacity.toLocaleString("en-US")} Mbps link (busiest direction)`;
   } else {
     const down = trafficLatest[0] ?? null;
     const up = trafficLatest[1] ?? null;

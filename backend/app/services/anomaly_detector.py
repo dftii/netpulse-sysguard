@@ -3,13 +3,20 @@
 The detector keeps a bounded rolling baseline per node and per metric and combines
 z-score analysis, absolute thresholds and a linear-regression trend test:
 
-* CPU_SPIKE             - z-score outlier (with an absolute floor) or sustained critical load
+* CPU_SPIKE             - z-score outlier on an already busy CPU, or sustained critical load
 * MEMORY_LEAK           - steady, strongly linear growth of memory utilisation
-* BANDWIDTH_SATURATION  - link utilisation above a limit, or a traffic burst on a busy link
+* BANDWIDTH_SATURATION  - busiest-direction link utilisation above a limit, or a burst on a busy link
 * CRITICAL_LATENCY      - absolute latency limit or a large relative jump
 * DISK_PRESSURE         - absolute fill level or a sudden jump on an already full disk
-* THERMAL_SPIKE         - absolute temperature limits or a sudden rise towards a hot operating point
+* THERMAL_SPIKE         - absolute temperature limits or a sudden, large rise into the hot range
 * SERVICE_DOWN          - node unreachable (OFFLINE) for several consecutive samples
+
+Z-scores answer "is this unusual for this node?", not "is this dangerous?": live 1 Hz telemetry is
+noisy and bursty, so a statistical outlier only raises an alert when the value is also high in
+absolute terms and well above the baseline, and on its own it is never more than a WARNING.
+CRITICAL is reserved for absolute limits (critical CPU, saturated link, critical latency...).
+
+Links are full duplex, so bandwidth utilisation is the busiest direction over the link capacity.
 
 OFFLINE samples carry placeholder metrics, so they only feed the service-down counter: they
 never reach a baseline and no other evaluator runs for them.
@@ -47,7 +54,7 @@ METRIC_CPU = "cpu_percent"
 METRIC_MEMORY = "memory_percent"
 METRIC_DISK = "disk_percent"
 METRIC_LATENCY = "latency_ms"
-METRIC_NET_TOTAL = "net_total_kbps"
+METRIC_NET_PEAK = "net_peak_kbps"
 METRIC_TEMPERATURE = "temperature_c"
 METRIC_OFFLINE_SAMPLES = "offline_samples"
 TRACKED_METRICS: tuple[str, ...] = (
@@ -55,26 +62,29 @@ TRACKED_METRICS: tuple[str, ...] = (
     METRIC_MEMORY,
     METRIC_DISK,
     METRIC_LATENCY,
-    METRIC_NET_TOTAL,
+    METRIC_NET_PEAK,
     METRIC_TEMPERATURE,
 )
 _FROZEN_METRICS: frozenset[str] = frozenset(
-    {METRIC_CPU, METRIC_DISK, METRIC_LATENCY, METRIC_NET_TOTAL, METRIC_TEMPERATURE}
+    {METRIC_CPU, METRIC_DISK, METRIC_LATENCY, METRIC_NET_PEAK, METRIC_TEMPERATURE}
 )
 
 _CPU_SUSTAINED_SAMPLES = 3
-_CPU_MIN_ABSOLUTE_PERCENT = 50.0
-_CPU_MIN_RISE_POINTS = 10.0
-_CPU_CRITICAL_Z_FACTOR = 1.5
+# A CPU outlier must persist this long (seconds at 1 Hz) to alert: short workload bursts are normal.
+_CPU_OUTLIER_PERSISTENCE_SAMPLES = 10
+_CPU_MIN_ABSOLUTE_PERCENT = 70.0
+_CPU_MIN_RISE_POINTS = 20.0
 _MEMORY_LEAK_MIN_POINTS = 30
 _MEMORY_LEAK_MIN_RISE_POINTS = 5.0
 _MEMORY_CRITICAL_PERCENT = 90.0
 _BANDWIDTH_CRITICAL_PERCENT = 95.0
-_BANDWIDTH_BURST_MIN_PERCENT = 50.0
+_BANDWIDTH_BURST_MIN_PERCENT = 60.0
+_BANDWIDTH_BURST_MIN_RISE_POINTS = 15.0
 _LATENCY_MIN_ABSOLUTE_MS = 50.0
 _LATENCY_RELATIVE_FACTOR = 3.0
 _DISK_JUMP_MIN_PERCENT = 80.0
-_THERMAL_JUMP_MIN_C = 70.0
+_THERMAL_JUMP_MIN_C = 75.0
+_THERMAL_JUMP_MIN_RISE_C = 8.0
 
 _SEVERITY_RANK: dict[AlertSeverity, int] = {
     AlertSeverity.INFO: 0,
@@ -246,6 +256,7 @@ class _NodeState:
     memory_window: deque[float]
     anomalous_streak: dict[str, int] = field(default_factory=dict)
     cpu_critical_streak: int = 0
+    cpu_outlier_streak: int = 0
     last_alert: dict[AnomalyType, tuple[datetime, AlertSeverity]] = field(default_factory=dict)
     offline_samples: int = 0
     offline_since: datetime | None = None
@@ -268,12 +279,13 @@ class AnomalyDetector:
             return self._analyze_offline(sample, state)
         state.offline_samples = 0
         state.offline_since = None
-        net_total = sample.net_upload_kbps + sample.net_download_kbps
+        # Full-duplex link: each direction has the whole capacity, so the busiest one is what saturates.
+        net_peak = max(sample.net_upload_kbps, sample.net_download_kbps)
 
         observations: dict[str, _Observation] = {
             METRIC_CPU: self._observe(state, METRIC_CPU, sample.cpu_percent),
             METRIC_DISK: self._observe(state, METRIC_DISK, sample.disk_percent),
-            METRIC_NET_TOTAL: self._observe(state, METRIC_NET_TOTAL, net_total),
+            METRIC_NET_PEAK: self._observe(state, METRIC_NET_PEAK, net_peak),
         }
         if sample.latency_ms is not None:
             observations[METRIC_LATENCY] = self._observe(state, METRIC_LATENCY, sample.latency_ms)
@@ -286,7 +298,7 @@ class AnomalyDetector:
         candidates: list[AnomalyAlertCreate | None] = [
             self._evaluate_cpu(sample, state, observations[METRIC_CPU]),
             self._evaluate_memory(sample, state),
-            self._evaluate_bandwidth(sample, observations[METRIC_NET_TOTAL]),
+            self._evaluate_bandwidth(sample, observations[METRIC_NET_PEAK]),
             self._evaluate_latency(sample, observations.get(METRIC_LATENCY)),
             self._evaluate_disk(sample, observations[METRIC_DISK]),
             self._evaluate_temperature(sample, observations.get(METRIC_TEMPERATURE)),
@@ -465,21 +477,22 @@ class AnomalyDetector:
 
         state.cpu_critical_streak = state.cpu_critical_streak + 1 if value >= critical else 0
         sustained = state.cpu_critical_streak >= _CPU_SUSTAINED_SAMPLES
-        statistical = (
+        outlier = (
             observation.z is not None
             and observation.mean is not None
             and observation.z >= z_threshold
             and value >= max(observation.mean + _CPU_MIN_RISE_POINTS, _CPU_MIN_ABSOLUTE_PERCENT)
         )
+        state.cpu_outlier_streak = state.cpu_outlier_streak + 1 if outlier else 0
+        statistical = state.cpu_outlier_streak >= _CPU_OUTLIER_PERSISTENCE_SAMPLES
         if not statistical and not sustained:
             return None
 
-        is_critical = value >= critical or (
-            observation.z is not None and observation.z >= z_threshold * _CPU_CRITICAL_Z_FACTOR
-        )
-        severity = AlertSeverity.CRITICAL if is_critical else AlertSeverity.WARNING
+        # A statistical outlier alone is a WARNING; only the absolute limit makes it CRITICAL.
+        severity = AlertSeverity.CRITICAL if value >= critical else AlertSeverity.WARNING
         if statistical:
-            message = f"CPU spike on {sample.hostname}: {value:.1f}%{self._clause(observation, '%')}"
+            lead = [f"{state.cpu_outlier_streak} consecutive samples above baseline"]
+            message = f"CPU spike on {sample.hostname}: {value:.1f}%{self._clause(observation, '%', lead)}"
             threshold = z_threshold
         else:
             lead = [f"{state.cpu_critical_streak} consecutive samples", f"limit {critical:.0f}%"]
@@ -528,15 +541,16 @@ class AnomalyDetector:
             message,
         )
 
-    def _evaluate_bandwidth(self, sample: NodeTelemetry, total_observation: _Observation) -> AnomalyAlertCreate | None:
+    def _evaluate_bandwidth(self, sample: NodeTelemetry, peak_observation: _Observation) -> AnomalyAlertCreate | None:
         cfg = self._settings
         capacity_kbps = sample.link_capacity_mbps * 1000.0
         to_percent = 100.0 / capacity_kbps
-        observation = total_observation.scaled(to_percent)
+        observation = peak_observation.scaled(to_percent)
         utilisation = observation.value
         z_threshold = cfg.anomaly_zscore_threshold
         metric = "net_utilization_percent"
-        throughput = f"{total_observation.value / 1000.0:.1f} Mbps of {sample.link_capacity_mbps:g} Mbps"
+        direction = "upload" if sample.net_upload_kbps >= sample.net_download_kbps else "download"
+        throughput = f"{peak_observation.value / 1000.0:.1f} Mbps {direction} of {sample.link_capacity_mbps:g} Mbps"
 
         if utilisation >= cfg.anomaly_bandwidth_saturation_percent:
             severity = (
@@ -557,8 +571,9 @@ class AnomalyDetector:
             )
         if (
             observation.z is not None
+            and observation.mean is not None
             and observation.z >= z_threshold
-            and utilisation >= _BANDWIDTH_BURST_MIN_PERCENT
+            and utilisation >= max(observation.mean + _BANDWIDTH_BURST_MIN_RISE_POINTS, _BANDWIDTH_BURST_MIN_PERCENT)
         ):
             message = (
                 f"Network traffic burst on {sample.hostname}: link at {utilisation:.1f}% "
@@ -669,7 +684,12 @@ class AnomalyDetector:
                 cfg.anomaly_temperature_warning_c,
                 message,
             )
-        if observation.z is not None and observation.z >= z_threshold and value >= _THERMAL_JUMP_MIN_C:
+        if (
+            observation.z is not None
+            and observation.mean is not None
+            and observation.z >= z_threshold
+            and value >= max(observation.mean + _THERMAL_JUMP_MIN_RISE_C, _THERMAL_JUMP_MIN_C)
+        ):
             message = f"Sudden temperature rise on {sample.hostname}: {value:.1f}°C{self._clause(observation, '°C')}"
             return self._build(
                 sample,
