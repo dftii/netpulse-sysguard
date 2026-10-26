@@ -137,9 +137,9 @@ See `.env.example` for the full description of each value.
 
 ## Deployment: GitHub Pages
 
-The workflow `.github/workflows/deploy-pages.yml` builds the frontend and publishes `frontend/dist`
-to GitHub Pages. It runs on every push to `main` that changes `frontend/**` or the workflow
-file, and it can be started by hand from the Actions tab (`workflow_dispatch`).
+The workflow `.github/workflows/deploy.yml` builds the frontend and publishes `frontend/dist`
+to GitHub Pages. It runs on every push to `main`,
+and it can be started by hand from the Actions tab (`workflow_dispatch`).
 
 One-time setup in the repository:
 

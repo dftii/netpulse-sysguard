@@ -4,6 +4,7 @@ import { Radar } from "lucide-react";
 import type { TelemetryController } from "../../types/dashboard";
 import { ClusterStatusPill } from "./ClusterStatusPill";
 import { ConnectionStatus } from "./ConnectionStatus";
+import { ExportReportButton } from "./ExportReportButton";
 import { KpiRow } from "./KpiRow";
 import { LiveClock } from "./LiveClock";
 import { ModeSelector } from "./ModeSelector";
@@ -32,6 +33,7 @@ export function DashboardHeader({ controller }: DashboardHeaderProps) {
           <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
             <ClusterStatusPill summary={state.frame?.summary ?? null} phase={state.status.phase} />
             <LiveClock />
+            <ExportReportButton controller={controller} />
           </div>
         </div>
 

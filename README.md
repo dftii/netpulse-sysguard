@@ -7,13 +7,13 @@
 [![Live Demo](https://img.shields.io/badge/%E2%96%B6%20LIVE%20DEMO-GitHub%20Pages-22d3ee?style=for-the-badge&logo=github&logoColor=white)](https://dftii.github.io/netpulse-sysguard/)
 
 [![CI](https://github.com/dftii/netpulse-sysguard/actions/workflows/ci.yml/badge.svg)](https://github.com/dftii/netpulse-sysguard/actions/workflows/ci.yml)
-[![Deploy](https://github.com/dftii/netpulse-sysguard/actions/workflows/deploy-pages.yml/badge.svg)](https://github.com/dftii/netpulse-sysguard/actions/workflows/deploy-pages.yml)
+[![Deploy](https://github.com/dftii/netpulse-sysguard/actions/workflows/deploy.yml/badge.svg)](https://github.com/dftii/netpulse-sysguard/actions/workflows/deploy.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 <br />
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](backend/requirements.txt)
 [![FastAPI](https://img.shields.io/badge/FastAPI-WebSockets-009688?logo=fastapi&logoColor=white)](backend/app/main.py)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0%20async-D71F00?logo=sqlalchemy&logoColor=white)](backend/app/database.py)
-[![pytest](https://img.shields.io/badge/tests-217%20passed-0A9EDC?logo=pytest&logoColor=white)](backend/tests)
+[![pytest](https://img.shields.io/badge/tests-225%20passed-0A9EDC?logo=pytest&logoColor=white)](backend/tests)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/package.json)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](frontend/tsconfig.app.json)
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite&logoColor=white)](frontend/vite.config.ts)
@@ -148,7 +148,7 @@ python -m venv .venv
 .venv/Scripts/activate              # Linux/macOS: source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env                # optional: tune NETPULSE_* settings
-pytest                              # 217 tests
+pytest                              # 225 tests
 python seed.py                      # optional: 24 h demo dataset (--reset to rebuild)
 python run.py                       # http://127.0.0.1:8000/docs
 ```
@@ -183,7 +183,7 @@ The image is based on `python:3.12-slim`, runs as a non-root user, stores SQLite
 
 ### 5. GitHub Pages
 
-The [`deploy-pages.yml`](.github/workflows/deploy-pages.yml) workflow builds the dashboard with `VITE_DEFAULT_MODE=simulation` and publishes it on every push to `main` that touches `frontend/`. Enable it once in **Settings → Pages → Build and deployment → Source: GitHub Actions**.
+The [`deploy.yml`](.github/workflows/deploy.yml) workflow builds the dashboard with `VITE_DEFAULT_MODE=simulation` and publishes it on every push to `main` (or on demand from the Actions tab). Enable it once in **Settings → Pages → Build and deployment → Source: GitHub Actions**.
 
 ## API
 

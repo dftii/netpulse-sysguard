@@ -10,11 +10,22 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { ANOMALY_LABELS } from "../lib/format";
 import { BackendSource } from "../services/backendSource";
-import { getApiBaseUrl, persistMode, probeBackend, resolveInitialMode } from "../services/modeResolver";
+import {
+  getApiBaseUrl,
+  isMixedContentBackend,
+  persistMode,
+  probeBackend,
+  resolveInitialMode,
+} from "../services/modeResolver";
 import { SimulationSource } from "../services/simulation/simulationSource";
 import type { TelemetrySource, Unsubscribe } from "../services/telemetrySource";
 import { SourceError } from "../services/telemetrySource";
-import type { IncidentInjectionRequest, PortAuditRead, PortScanRequest } from "../types/api";
+import type {
+  IncidentInjectionRequest,
+  PortAuditRead,
+  PortAuditSummary,
+  PortScanRequest,
+} from "../types/api";
 import type {
   ConnectionMode,
   LogLevel,
@@ -194,6 +205,17 @@ export function useTelemetry(): TelemetryController {
       }
 
       const baseUrl = getApiBaseUrl();
+      if (isMixedContentBackend(baseUrl)) {
+        // An https page (e.g. GitHub Pages) cannot reach a plain-http backend: skip the doomed request.
+        setMeta((current) => ({ ...current, backendAvailable: false }));
+        log(
+          "error",
+          "system",
+          `Cannot reach ${baseUrl} from an https page (mixed content); run the dashboard locally to use the live backend`,
+        );
+        if (sessionRef.current === null) startSource("simulation");
+        return;
+      }
       void probeBackend(baseUrl).then((reachable) => {
         if (generation !== generationRef.current) return;
         setMeta((current) => ({ ...current, backendAvailable: reachable }));
@@ -271,6 +293,19 @@ export function useTelemetry(): TelemetryController {
     [requireSource, writeLogs],
   );
 
+  const listPortScans = useCallback(
+    async (limit?: number): Promise<PortAuditSummary[]> => {
+      const source = requireSource();
+      try {
+        return await source.listPortScans(limit);
+      } catch (error) {
+        log("error", "scanner", `Could not list port audits: ${errorMessage(error)}`);
+        throw error;
+      }
+    },
+    [requireSource, log],
+  );
+
   return useMemo<TelemetryController>(
     () => ({
       state: reducerState.view,
@@ -282,9 +317,10 @@ export function useTelemetry(): TelemetryController {
       acknowledgeAlert,
       injectIncident,
       runPortScan,
+      listPortScans,
       log,
       clearLogs,
     }),
-    [reducerState.view, meta, setMode, acknowledgeAlert, injectIncident, runPortScan, log, clearLogs],
+    [reducerState.view, meta, setMode, acknowledgeAlert, injectIncident, runPortScan, listPortScans, log, clearLogs],
   );
 }

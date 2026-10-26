@@ -5,6 +5,7 @@ import type {
   IncidentInjectionRequest,
   NodeStatus,
   PortAuditRead,
+  PortAuditSummary,
   PortScanRequest,
   TelemetryBroadcast,
 } from "./api";
@@ -92,6 +93,8 @@ export interface TelemetryController {
   injectIncident(request: IncidentInjectionRequest): Promise<void>;
   /** Runs the audit through the active source and writes scanner lines to the log console. */
   runPortScan(request: PortScanRequest, signal?: AbortSignal): Promise<PortAuditRead>;
+  /** Recent port-audit headers (no findings), newest first, through the active source. */
+  listPortScans(limit?: number): Promise<PortAuditSummary[]>;
   /** Append an operator/system line to the log console. */
   log(level: LogLevel, source: LogSource, message: string, host?: string | null): void;
   clearLogs(): void;

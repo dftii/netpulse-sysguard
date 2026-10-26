@@ -596,3 +596,47 @@ async def test_failing_probe_leaves_latency_unset(monkeypatch: pytest.MonkeyPatc
 
     assert snapshot.latency_ms is None
     await collector.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Host temperature sensors across platforms
+# ---------------------------------------------------------------------------
+
+
+class _Sensor:
+    def __init__(self, current: object) -> None:
+        self.current = current
+
+
+class _Unlabelled:
+    """A sensor entry without a ``current`` attribute (broken driver)."""
+
+
+def test_hottest_reading_ignores_invalid_entries() -> None:
+    readings = {
+        "coretemp": [_Sensor(48.0), _Sensor(float("nan")), _Sensor(None), _Unlabelled()],
+        "acpitz": [_Sensor("61.5"), _Sensor("n/a"), _Sensor(-273.0), _Sensor(3000.0)],
+        "nvme": None,
+    }
+    assert tc._hottest_reading(readings) == 61.5
+
+
+@pytest.mark.parametrize("readings", [{}, None, [], {"coretemp": []}, {"acpitz": [_Sensor(float("inf"))]}])
+def test_hottest_reading_without_usable_sensors(readings: object) -> None:
+    assert tc._hottest_reading(readings) is None
+
+
+def test_host_temperature_when_platform_has_no_sensor_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Windows and macOS builds of psutil do not define sensors_temperatures at all.
+    monkeypatch.delattr(tc.psutil, "sensors_temperatures", raising=False)
+    source = HostTelemetrySource(Settings())
+    assert source._read_temperature() is None
+
+
+def test_host_temperature_when_sensor_api_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken() -> dict[str, list[_Sensor]]:
+        raise AttributeError("sensor driver unavailable")
+
+    monkeypatch.setattr(tc.psutil, "sensors_temperatures", broken, raising=False)
+    source = HostTelemetrySource(Settings())
+    assert source._read_temperature() is None

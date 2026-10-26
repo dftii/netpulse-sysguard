@@ -40,8 +40,25 @@ export async function probeBackend(baseUrl: string, timeoutMs: number = DEFAULT_
 /** True on GitHub Pages hosting, or when the build forces the simulation (no backend can exist there). */
 export function isStaticHosting(): boolean {
   if (import.meta.env.VITE_DEFAULT_MODE === "simulation") return true;
+  return isGitHubPagesHost();
+}
+
+function isGitHubPagesHost(): boolean {
   if (typeof window === "undefined") return false;
   return window.location.hostname.toLowerCase().endsWith(".github.io");
+}
+
+/**
+ * True when an https page would have to reach a plain-http backend: browsers block (or prompt for)
+ * that mixed-content request, so probing it would only add latency and console noise.
+ */
+export function isMixedContentBackend(baseUrl: string): boolean {
+  if (typeof window === "undefined" || window.location.protocol !== "https:") return false;
+  try {
+    return new URL(baseUrl).protocol === "http:";
+  } catch {
+    return false;
+  }
 }
 
 /** The mode the user picked manually in a previous session, if any. */
@@ -64,20 +81,26 @@ export function persistMode(mode: ConnectionMode): void {
 }
 
 /**
- * Resolution order:
- *  1. VITE_DEFAULT_MODE "backend" / "simulation" forces that mode.
- *  2. Static hosting goes straight to the simulation without probing.
- *  3. A stored manual "simulation" choice is honoured without probing.
- *  4. Otherwise the backend is probed: reachable -> backend, unreachable -> simulation (auto-selected).
+ * Resolution order (every branch except the probe resolves synchronously, so the first simulated
+ * frame renders immediately on static hosting):
+ *  1. GitHub Pages hosts always run the simulation (auto-selected, so the UI explains why).
+ *  2. VITE_DEFAULT_MODE "backend" / "simulation" forces that mode.
+ *  3. An https page with a plain-http backend goes straight to the simulation (mixed content).
+ *  4. A stored manual "simulation" choice is honoured without probing.
+ *  5. Otherwise the backend is probed: reachable -> backend, unreachable -> simulation (auto-selected).
  *     A stored "backend" choice is honoured only when the probe succeeds.
  */
 export async function resolveInitialMode(): Promise<ResolvedMode> {
+  if (isGitHubPagesHost()) {
+    return { mode: "simulation", backendAvailable: null, autoSelected: true };
+  }
+
   const forced = import.meta.env.VITE_DEFAULT_MODE;
   if (forced === "backend" || forced === "simulation") {
     return { mode: forced, backendAvailable: null, autoSelected: false };
   }
 
-  if (isStaticHosting()) {
+  if (isMixedContentBackend(getApiBaseUrl())) {
     return { mode: "simulation", backendAvailable: null, autoSelected: true };
   }
 

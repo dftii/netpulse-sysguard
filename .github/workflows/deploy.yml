@@ -1,11 +1,9 @@
 name: Deploy frontend to GitHub Pages
 
+# Every push to main redeploys the static demo; it can also be started by hand from the Actions tab.
 on:
   push:
     branches: [main]
-    paths:
-      - "frontend/**"
-      - ".github/workflows/deploy-pages.yml"
   workflow_dispatch:
 
 permissions:

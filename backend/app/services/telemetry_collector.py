@@ -152,6 +152,29 @@ def _describe_os() -> str:
     return " ".join(parts)[:128] or "Unknown OS"
 
 
+_MIN_PLAUSIBLE_TEMPERATURE_C = -40.0
+_MAX_PLAUSIBLE_TEMPERATURE_C = 150.0
+
+
+def _hottest_reading(readings: object) -> float | None:
+    """Maximum finite, physically plausible ``current`` value of a sensors_temperatures() mapping."""
+    if not isinstance(readings, dict):
+        return None
+    values: list[float] = []
+    for entries in readings.values():
+        for entry in entries or ():
+            current = getattr(entry, "current", None)
+            if current is None:
+                continue
+            try:
+                value = float(current)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and _MIN_PLAUSIBLE_TEMPERATURE_C < value < _MAX_PLAUSIBLE_TEMPERATURE_C:
+                values.append(value)
+    return max(values) if values else None
+
+
 def _system_disk_path() -> str:
     """Path of the system volume whose usage represents the host disk."""
     if os.name == "nt":
@@ -266,17 +289,16 @@ class HostTelemetrySource:
     # -- sampling --------------------------------------------------------
 
     def _read_temperature(self) -> float | None:
+        """Hottest plausible sensor reading in °C, or None when the platform exposes none.
+
+        ``psutil.sensors_temperatures`` does not exist on Windows or macOS, can return an empty or
+        partial mapping on Linux (containers, VMs, missing drivers) and some drivers report NaN or
+        sentinel values, so every step is defensive.
+        """
         reader = getattr(psutil, "sensors_temperatures", None)
-        if reader is None:
+        if not callable(reader):
             return None
-        readings = _safe_call(reader, {})
-        values = [
-            float(entry.current)
-            for entries in readings.values()
-            for entry in entries
-            if entry.current is not None
-        ]
-        return max(values) if values else None
+        return _safe_call(lambda: _hottest_reading(reader()), None)
 
     def _sample_blocking(self) -> _HostSample:
         """Collect every psutil metric. Runs in a worker thread."""
