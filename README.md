@@ -13,7 +13,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](backend/requirements.txt)
 [![FastAPI](https://img.shields.io/badge/FastAPI-WebSockets-009688?logo=fastapi&logoColor=white)](backend/app/main.py)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0%20async-D71F00?logo=sqlalchemy&logoColor=white)](backend/app/database.py)
-[![pytest](https://img.shields.io/badge/tests-225%20passed-0A9EDC?logo=pytest&logoColor=white)](backend/tests)
+[![pytest](https://img.shields.io/badge/tests-250%20passed-0A9EDC?logo=pytest&logoColor=white)](backend/tests)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/package.json)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](frontend/tsconfig.app.json)
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite&logoColor=white)](frontend/vite.config.ts)
@@ -174,7 +174,7 @@ python -m venv .venv
 .venv/Scripts/activate              # Linux/macOS: source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env                # optional: tune NETPULSE_* settings
-pytest                              # 225 tests
+pytest                              # 250 tests
 python seed.py                      # optional: 24 h demo dataset (--reset to rebuild)
 python run.py                       # http://127.0.0.1:8000/docs
 ```

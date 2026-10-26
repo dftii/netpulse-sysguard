@@ -13,7 +13,7 @@ Contexto para que Claude retome el proyecto en cualquier máquina.
 ## Fases
 
 1. **Fase 1 — Backend: COMPLETADA.** 158 tests en verde. Subida en el commit `ec9e029`.
-2. **Fase 2 — Backend empresarial: COMPLETADA.** 225 tests en verde (217 al cierre de la fase; 8 más en la auditoría). Incluye las anomalías SERVICE_DOWN y THERMAL_SPIKE (en el detector y en el simulador), `seed.py` idempotente con `--reset`, Docker y compose, y `.dockerignore`.
+2. **Fase 2 — Backend empresarial: COMPLETADA.** 217 tests en verde al cierre de la fase. Tras la auditoría y la corrección del detector hay 250 en total. Incluye las anomalías SERVICE_DOWN y THERMAL_SPIKE (en el detector y en el simulador), `seed.py` idempotente con `--reset`, Docker y compose, y `.dockerignore`.
 3. **Fase 3 — Frontend NOC + README: COMPLETADA.** React 19, TypeScript strict, Vite 8, Tailwind 4 y Lucide. Las gráficas son SVG nativo, sin Recharts: así lo pidió el prompt de la Fase 3, que sustituyó el plan anterior de React 18 + Recharts. Incluye un modo backend real, un motor de simulación en el navegador para GitHub Pages, CI (`ci.yml`) y deploy a Pages con GitHub Actions (`deploy.yml`, en cada push a main). La cabecera tiene un botón "Export report" que descarga un informe JSON (`lib/auditReport.ts`) y funciona en los dos modos. Lo siguiente previsible es añadir capturas al README.
 
 ## Frontend (frontend/)
@@ -96,7 +96,7 @@ cd backend
 python -m venv .venv            # Python 3.11+ (en el PC original: 3.14)
 .venv/Scripts/activate          # Linux/macOS: source .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                          # esperado: 225 passed
+pytest                          # esperado: 250 passed
 python seed.py                  # opcional: datos demo de 24 h (--reset para regenerarlos)
 python run.py                   # http://127.0.0.1:8000/docs
 ```
