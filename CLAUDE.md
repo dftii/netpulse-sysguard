@@ -14,7 +14,24 @@ Contexto para que Claude retome el proyecto en cualquier máquina.
 
 1. **Fase 1 — Backend: COMPLETADA.** 158 tests en verde. Subida en el commit `ec9e029`.
 2. **Fase 2 — Backend empresarial: COMPLETADA.** 217 tests en verde. Incluye las anomalías SERVICE_DOWN y THERMAL_SPIKE (en el detector y en el simulador), `seed.py` idempotente con `--reset`, Docker y compose, y `.dockerignore`.
-3. **Fase 3 — Frontend: PENDIENTE (siguiente paso).** Dashboard en React 18 + Vite + TypeScript + TailwindCSS + Recharts que consume `ws://localhost:8000/ws/telemetry` y la API REST. El plan de carpetas está en `frontend/README.md`, y `frontend/src/{components,hooks,pages,services,types}` solo contienen `.gitkeep`. Lo previsible después es CI con GitHub Actions y pulir el README con capturas.
+3. **Fase 3 — Frontend NOC + README: COMPLETADA.** React 19, TypeScript strict, Vite 8, Tailwind 4 y Lucide. Las gráficas son SVG nativo, sin Recharts: así lo pidió el prompt de la Fase 3, que sustituyó el plan anterior de React 18 + Recharts. Incluye un modo backend real, un motor de simulación en el navegador para GitHub Pages, CI y deploy a Pages con GitHub Actions. Lo siguiente previsible es añadir capturas al README.
+
+## Frontend (frontend/)
+
+```
+src/types/api.ts          espejo TS de enums.py/schemas.py (si cambia un schema del backend, actualízalo aquí)
+src/types/dashboard.ts    TelemetryState, TelemetryController (contrato hook → componentes), LogEntry
+src/services/telemetrySource.ts   interfaz TelemetrySource común + SourceError
+src/services/{apiClient,backendSource,modeResolver}.ts   REST, WS con reconexión/ping, detección de modo
+src/services/simulation/  port TS del simulador, detector, catálogo de puertos (44) y escáner del backend
+src/hooks/useTelemetry.ts (+ telemetryReducer.ts, scanLogs.ts)   un dispatch por frame, historial 120 s, logs
+src/components/{header,servers,charts,ui,scanner,incidents,console}/   App.tsx solo compone
+```
+
+- Detección de modo: primero manda `VITE_DEFAULT_MODE`; después, un host `*.github.io` va a simulación; después, una elección "simulation" guardada en localStorage (`netpulse.mode`); por último, un probe a `/api/health` con timeout de 1,5 s. El build de Pages usa `VITE_DEFAULT_MODE=simulation`. `vite.config.ts` lleva `base: "./"`.
+- En la simulación, `zscoreThreshold` es 6 y la amplitud de los bursts está al 35 %. Con los valores del backend (z=3) salían falsas alarmas en reposo, aproximadamente una cada 23 s.
+- Pendientes conocidos, en el backend: con z=3 también genera alertas en reposo. Además, el uso de ancho de banda divide subida+bajada entre la capacidad de un solo sentido, y por eso salen valores de hasta ~180 %.
+- Dev: `npm --prefix frontend run dev` (5173). Las versiones npm están fijadas (todas tienen más de 2 semanas de antigüedad). `.claude/launch.json` define las previsualizaciones de frontend y backend.
 
 ## Stack del backend
 
@@ -83,6 +100,8 @@ pytest                          # esperado: 217 passed
 python seed.py                  # opcional: datos demo de 24 h (--reset para regenerarlos)
 python run.py                   # http://127.0.0.1:8000/docs
 ```
+
+Frontend: `cd frontend && npm install && npm run dev` (http://localhost:5173), y para producción `npm run build`.
 
 Con Docker: `docker compose up -d --build` y, opcionalmente, `docker compose --profile seed run --rm seed`.
 
